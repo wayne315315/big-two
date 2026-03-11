@@ -4,6 +4,7 @@ import random
 # Import your existing game logic
 from helper import RANKS, SUITS, get_card_value, evaluate_play, is_valid_beat
 from player import Player, BotPlayer
+from tf_deep_cfr_bot import TFDeepCFRBot
 
 app = Flask(__name__)
 
@@ -173,7 +174,7 @@ def bot_turn():
 def check_table_control():
     """Checks if a player won the trick (the other passed)."""
     if game_instance['last_player_idx'] == game_instance['current_idx']:
-        game_instance['message'] += " The table is yours!"
+        #game_instance['message'] += " The table is yours!"
         game_instance['game_state_dict']['table_eval'] = None
         game_instance['game_state_dict']['table_cards'] = []
 
