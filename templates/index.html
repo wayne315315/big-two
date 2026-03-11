@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Big Two Web</title>
+    <style>
+        body { font-family: Arial, sans-serif; background-color: #2E4053; color: white; text-align: center; margin: 0; padding: 20px; }
+        .table-area { background-color: #1E8449; border: 5px solid #145A32; border-radius: 15px; padding: 40px; margin: 20px auto; max-width: 800px; min-height: 150px; }
+        .card { display: inline-block; background-color: white; color: black; border-radius: 8px; width: 60px; height: 90px; margin: 5px; line-height: 90px; font-size: 20px; font-weight: bold; cursor: pointer; user-select: none; box-shadow: 2px 2px 5px rgba(0,0,0,0.3); transition: transform 0.1s; }
+        .card.red { color: #E74C3C; }
+        .card.selected { transform: translateY(-15px); border: 3px solid #F1C40F; box-sizing: border-box; }
+        .card-table { cursor: default; }
+        .controls { margin-top: 20px; }
+        button { padding: 10px 20px; font-size: 16px; font-weight: bold; margin: 5px; cursor: pointer; border-radius: 5px; border: none; }
+        .btn-play { background-color: #3498DB; color: white; }
+        .btn-pass { background-color: #E74C3C; color: white; }
+        .btn-reset { background-color: #95A5A6; color: white; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        #message { font-size: 18px; color: #F1C40F; margin-bottom: 15px; font-style: italic; }
+    </style>
+</head>
+<body>
+
+    <h2>Bot Cards Remaining: <span id="bot-count">13</span></h2>
+    
+    <div class="table-area">
+        <div id="message">Loading game...</div>
+        <div id="table-cards"></div>
+    </div>
+
+    <h3>Your Hand</h3>
+    <div id="human-hand"></div>
+
+    <div class="controls">
+        <button id="btn-play" class="btn-play" onclick="playCards()">Play Selected</button>
+        <button id="btn-pass" class="btn-pass" onclick="passTurn()">Pass</button>
+        <button class="btn-reset" onclick="resetGame()">New Game</button>
+    </div>
+
+    <script>
+        let selectedCards = [];
+        let currentState = {};
+
+        const suitSymbols = { 'Spades': '♠', 'Hearts': '♥', 'Diamonds': '♦', 'Clubs': '♣' };
+
+        // Fetch the initial game state on load
+        window.onload = fetchState;
+
+        async function fetchState() {
+            const response = await fetch('/api/state');
+            currentState = await response.json();
+            renderUI();
+            
+            // If it's the bot's turn, trigger bot action after a small delay
+            if (currentState.current_turn === 1 && !currentState.is_game_over) {
+                setTimeout(triggerBot, 1500);
+            }
+        }
+
+        function renderUI() {
+            document.getElementById('bot-count').innerText = currentState.bot_card_count;
+            document.getElementById('message').innerText = currentState.message;
+            
+            // Render Table Cards
+            const tableDiv = document.getElementById('table-cards');
+            tableDiv.innerHTML = '';
+            if (currentState.table_cards.length === 0) {
+                tableDiv.innerHTML = '<span style="color:#A9DFBF;">[Empty Table]</span>';
+            } else {
+                currentState.table_cards.forEach(card => {
+                    tableDiv.appendChild(createCardHTML(card, false));
+                });
+            }
+
+            // Render Human Hand
+            const handDiv = document.getElementById('human-hand');
+            handDiv.innerHTML = '';
+            selectedCards = []; // clear selection on UI refresh
+            currentState.human_hand.forEach((card, index) => {
+                const cardEl = createCardHTML(card, true, index);
+                handDiv.appendChild(cardEl);
+            });
+
+            // Update button states
+            const isMyTurn = (currentState.current_turn === 0 && !currentState.is_game_over);
+            document.getElementById('btn-play').disabled = !isMyTurn;
+            document.getElementById('btn-pass').disabled = !isMyTurn;
+        }
+
+        function createCardHTML(cardData, isClickable, index = -1) {
+            const rank = cardData[0];
+            const suit = cardData[1];
+            const isRed = (suit === 'Hearts' || suit === 'Diamonds');
+            
+            const el = document.createElement('div');
+            el.className = 'card' + (isRed ? ' red' : '') + (isClickable ? '' : ' card-table');
+            el.innerHTML = rank + suitSymbols[suit];
+            
+            if (isClickable) {
+                el.onclick = () => toggleSelection(el, cardData);
+            }
+            return el;
+        }
+
+        function toggleSelection(element, cardData) {
+            if (currentState.current_turn !== 0) return; // Only allow selection on your turn
+            
+            const idx = selectedCards.findIndex(c => c[0] === cardData[0] && c[1] === cardData[1]);
+            if (idx > -1) {
+                selectedCards.splice(idx, 1);
+                element.classList.remove('selected');
+            } else {
+                selectedCards.push(cardData);
+                element.classList.add('selected');
+            }
+        }
+
+        async function playCards() {
+            if (selectedCards.length === 0) {
+                alert("Please select cards to play!");
+                return;
+            }
+            
+            const response = await fetch('/api/play', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ cards: selectedCards })
+            });
+            
+            const data = await response.json();
+            if (data.error) {
+                alert(data.error);
+            } else {
+                currentState = data;
+                renderUI();
+                if (currentState.current_turn === 1 && !currentState.is_game_over) {
+                    setTimeout(triggerBot, 1500);
+                }
+            }
+        }
+
+        async function passTurn() {
+            const response = await fetch('/api/pass', { method: 'POST' });
+            const data = await response.json();
+            if (data.error) {
+                alert(data.error);
+            } else {
+                currentState = data;
+                renderUI();
+                if (currentState.current_turn === 1 && !currentState.is_game_over) {
+                    setTimeout(triggerBot, 1500);
+                }
+            }
+        }
+
+        async function triggerBot() {
+            document.getElementById('message').innerText = "Bot is thinking...";
+            const response = await fetch('/api/bot_turn', { method: 'POST' });
+            currentState = await response.json();
+            renderUI();
+            
+            // If bot won the trick and goes again
+            if (currentState.current_turn === 1 && !currentState.is_game_over) {
+                setTimeout(triggerBot, 1500);
+            }
+        }
+
+        async function resetGame() {
+            const response = await fetch('/api/reset', { method: 'POST' });
+            currentState = await response.json();
+            renderUI();
+            if (currentState.current_turn === 1) setTimeout(triggerBot, 1500);
+        }
+    </script>
+</body>
+</html>
