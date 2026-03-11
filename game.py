@@ -8,17 +8,19 @@ def play_game():
     # 1. Setup Deck & Players
     deck = [(rank, suit) for rank in RANKS for suit in SUITS]
     random.shuffle(deck)
+    # Distribute into 4 equal piles of 13 cards each
     piles = [deck[i * 13 : (i + 1) * 13] for i in range(4)]
     
     player1 = HumanPlayer("Player 1")
     player2 = BotPlayer("Big Two Bot")
     
+    # Assign to 2 players and discard the remaining 2 piles
     player1.receive_cards(piles[0])
     player2.receive_cards(piles[1])
     
     players = [player1, player2]
     
-    # Determine starting player
+    # Determine starting player based on absolute lowest card
     p1_lowest = player1.hand[0]
     p2_lowest = player2.hand[0]
     
@@ -46,6 +48,7 @@ def play_game():
         print("\n" + "="*40)
         current_player = players[current_idx]
         
+        # If the turn comes back to the last person who played, they win the trick and clear the table
         if last_player_idx == current_idx:
             print(f"{players[1 - current_idx].name} passed. {current_player.name} takes the table!")
             game_state['table_eval'] = None
@@ -71,7 +74,7 @@ def play_game():
                 
             # Handle First Turn Constraint
             if game_state['is_first_turn'] and game_state['lowest_card'] not in selected_cards:
-                print(f"Invalid play: You must include the starting card ({lowest_card[0]} of {lowest_card[1]}) on the first turn.")
+                print(f"Invalid play: You must include the starting card ({game_state['lowest_card'][0]} of {game_state['lowest_card'][1]}) on the first turn.")
                 continue
                 
             # Handle Evaluation & Beating the Table
@@ -81,7 +84,7 @@ def play_game():
                 continue
                 
             if not is_valid_beat(curr_eval, game_state['table_eval']):
-                print("Invalid play: Your play is not high enough to beat the table, or does not match the card quantity.")
+                print("Invalid play: Your play is not high enough to beat the table, or does not match the card quantity/type.")
                 continue
                 
             # Play is valid! Apply to game state.

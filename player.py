@@ -8,10 +8,12 @@ class Player:
         self.hand = []
 
     def receive_cards(self, cards):
+        """Adds cards to the player's hand and sorts them."""
         self.hand.extend(cards)
         self.hand.sort(key=get_card_value)
 
     def remove_cards(self, cards_to_remove):
+        """Removes played cards from the player's hand."""
         for card in cards_to_remove:
             self.hand.remove(card)
 
@@ -26,6 +28,7 @@ class Player:
 # --- HUMAN PLAYER IMPLEMENTATION ---
 class HumanPlayer(Player):
     def print_hand(self):
+        """Formats the hand nicely with index numbers for the player to choose from."""
         display = [f"[{i}] {c[0]}-{c[1][0]}" for i, c in enumerate(self.hand)]
         print("  ".join(display))
 
@@ -45,6 +48,7 @@ class HumanPlayer(Player):
             except (ValueError, IndexError):
                 print("Invalid input. Please enter valid numbers separated by commas.")
 
+# --- BOT PLAYER IMPLEMENTATION ---
 class BotPlayer(Player):
     def __init__(self, name="Bot"):
         super().__init__(name)
@@ -59,14 +63,13 @@ class BotPlayer(Player):
             return [game_state['lowest_card']]
 
         # 2. Analyze Hand for basic combinations
-        # Group cards by rank to easily find pairs and triples.
+        # Group cards by rank to easily find pairs. Triples are removed from logic.
         rank_groups = {}
         for card in self.hand:
             rank_groups[card[0]] = rank_groups.get(card[0], []) + [card]
         
-        # Extract all available pairs and triples (sorted lowest to highest)
+        # Extract all available pairs (sorted lowest to highest)
         pairs = [cards[:2] for cards in rank_groups.values() if len(cards) >= 2]
-        triples = [cards[:3] for cards in rank_groups.values() if len(cards) >= 3]
 
         # 3. Table Control (Free Play)
         # If the bot won the last trick, it plays its lowest pair. 
@@ -91,12 +94,6 @@ class BotPlayer(Player):
                 if is_valid_beat(evaluate_play(pair), game_state['table_eval']):
                     return pair
                     
-        elif table_type == 'Triple':
-            # Find the lowest triple that legally beats the table
-            for triple in triples:
-                if is_valid_beat(evaluate_play(triple), game_state['table_eval']):
-                    return triple
-                    
-        # Note: This basic bot doesn't search for 5-card hands like Straights or Flushes.
-        # If the human plays a 5-card hand, or if the bot cannot beat the table, it passes.
+        # Note: This basic bot doesn't actively search for 5-card hands like Straights or Full Houses.
+        # It will simply pass if faced with a 5-card hand.
         return []
