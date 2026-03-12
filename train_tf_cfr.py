@@ -7,13 +7,19 @@ import time
 from helper import RANKS, SUITS, get_card_value, evaluate_play
 from tf_deep_cfr_bot import TFDeepCFRBot, create_advantage_network
 
-def train_self_play(episodes=1000, batch_size=64):
+def train_self_play(episodes=1000, batch_size=64, model_path='tf_advantage_net.weights.h5'):
     print("="*50)
     print("INITIALIZING DEEP CFR SELF-PLAY TRAINING (TENSORFLOW)")
     print("="*50)
 
     # 1. Create the shared Neural Network and the optimizer
     shared_model = create_advantage_network()
+    try:
+        shared_model.load_weights(model_path)  # Load existing weights if available
+        print(f"Loaded existing weights from '{model_path}'")
+    except (FileNotFoundError, OSError):
+        print(f"No existing weights found at '{model_path}', starting with random weights.")
+
     optimizer = optimizers.Adam(learning_rate=0.001)
     shared_model.compile(optimizer=optimizer, loss='mse')
 
@@ -136,8 +142,8 @@ def train_self_play(episodes=1000, batch_size=64):
             metrics['p1_wins'] = 0
             metrics['p2_wins'] = 0
 
-    print("\nTraining Complete! Saving weights to 'tf_advantage_net.weights.h5'...")
-    shared_model.save_weights("tf_advantage_net.weights.h5")
+    print(f"\nTraining Complete! Saving weights to '{model_path}'...")
+    shared_model.save_weights(model_path)
 
 if __name__ == "__main__":
     train_self_play(episodes=500)

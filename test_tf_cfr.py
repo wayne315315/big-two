@@ -18,13 +18,13 @@ class SuppressPrint:
         sys.stdout = self._original_stdout
 
 # --- MAIN EVALUATION LOOP ---
-def test_model(num_games=100):
+def test_model(num_games=100, model_path="tf_advantage_net.weights.h5"):
     print("="*50)
     print(f"BENCHMARKING DEEP CFR BOT VS STANDARD BOT ({num_games} GAMES)")
     print("="*50)
     
     # 1. Initialize bots ONCE outside the loop so we don't reload the Keras model 100 times!
-    cfr_bot = TFDeepCFRBot(name="TF Deep CFR Bot", model_path="tf_advantage_net.weights.h5")
+    cfr_bot = TFDeepCFRBot(name="TF Deep CFR Bot", model_path=model_path)
     standard_bot = BotPlayer("Standard Bot")
     
     cfr_wins = 0
