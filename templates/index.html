@@ -28,10 +28,14 @@
         button { padding: 10px 20px; font-size: 16px; font-weight: bold; margin: 5px; cursor: pointer; border-radius: 5px; border: none; }
         .btn-play { background-color: #3498DB; color: white; }
         .btn-pass { background-color: #E74C3C; color: white; }
+        .btn-bot { background-color: #8E44AD; color: white; }
         .btn-reset { background-color: #95A5A6; color: white; }
         button:disabled { opacity: 0.5; cursor: not-allowed; }
         
         #message { font-size: 18px; color: #F1C40F; margin-bottom: 15px; font-style: italic; }
+        
+        .toggle-container { margin-top: 15px; font-size: 16px; color: #F1C40F; }
+        .toggle-container label { cursor: pointer; user-select: none; }
     </style>
 </head>
 <body>
@@ -62,7 +66,15 @@
     <div class="controls">
         <button id="btn-play" class="btn-play" onclick="playCards()">Play Selected</button>
         <button id="btn-pass" class="btn-pass" onclick="passTurn()">Pass</button>
+        <button id="btn-bot" class="btn-bot" onclick="triggerBot()" disabled>Force Bot Play</button>
         <button class="btn-reset" onclick="resetGame()">New Game</button>
+    </div>
+    
+    <div class="toggle-container">
+        <label>
+            <input type="checkbox" id="auto-bot-toggle" onchange="handleToggle()"> 
+            <strong>Auto-Play Bot Turn</strong>
+        </label>
     </div>
 
     <script>
@@ -77,10 +89,7 @@
             const response = await fetch('/api/state');
             currentState = await response.json();
             renderUI();
-            
-            if (currentState.current_turn === 1 && !currentState.is_game_over) {
-                setTimeout(triggerBot, 1500);
-            }
+            checkBotTurn();
         }
 
         function renderUI() {
@@ -144,12 +153,12 @@
                 handDiv.appendChild(createCardHTML(card, true, false));
             });
 
+            // Update button states
             const isMyTurn = (currentState.current_turn === 0 && !currentState.is_game_over);
             document.getElementById('btn-play').disabled = !isMyTurn;
             document.getElementById('btn-pass').disabled = !isMyTurn;
         }
 
-        // Adjusted createCardHTML to accept an isSmall boolean
         function createCardHTML(cardData, isClickable, isSmall) {
             const rank = cardData[0];
             const suit = cardData[1];
@@ -178,6 +187,35 @@
             }
         }
 
+        // --- NEW: Bot Turn Management Logic ---
+        
+        function handleToggle() {
+            // If the user checks the box while it's the bot's turn, trigger it immediately
+            if (document.getElementById('auto-bot-toggle').checked) {
+                checkBotTurn();
+            }
+        }
+
+        function checkBotTurn() {
+            const isBotTurn = (currentState.current_turn === 1 && !currentState.is_game_over);
+            const isAutoPlay = document.getElementById('auto-bot-toggle').checked;
+            
+            const botBtn = document.getElementById('btn-bot');
+            
+            if (isBotTurn) {
+                if (isAutoPlay) {
+                    botBtn.disabled = true; // Disable manual button
+                    setTimeout(triggerBot, 1500); // Play automatically after 1.5s
+                } else {
+                    botBtn.disabled = false; // Enable manual button
+                }
+            } else {
+                botBtn.disabled = true;
+            }
+        }
+
+        // --------------------------------------
+
         async function playCards() {
             if (selectedCards.length === 0) {
                 alert("Please select cards to play!");
@@ -196,9 +234,7 @@
             } else {
                 currentState = data;
                 renderUI();
-                if (currentState.current_turn === 1 && !currentState.is_game_over) {
-                    setTimeout(triggerBot, 1500);
-                }
+                checkBotTurn(); // Replaces direct setTimeout
             }
         }
 
@@ -210,28 +246,26 @@
             } else {
                 currentState = data;
                 renderUI();
-                if (currentState.current_turn === 1 && !currentState.is_game_over) {
-                    setTimeout(triggerBot, 1500);
-                }
+                checkBotTurn(); // Replaces direct setTimeout
             }
         }
 
         async function triggerBot() {
+            document.getElementById('btn-bot').disabled = true;
             document.getElementById('message').innerText = "Bot is thinking...";
+            
             const response = await fetch('/api/bot_turn', { method: 'POST' });
             currentState = await response.json();
-            renderUI();
             
-            if (currentState.current_turn === 1 && !currentState.is_game_over) {
-                setTimeout(triggerBot, 1500);
-            }
+            renderUI();
+            checkBotTurn(); // If bot won the trick and goes again, check if it should auto-play
         }
 
         async function resetGame() {
             const response = await fetch('/api/reset', { method: 'POST' });
             currentState = await response.json();
             renderUI();
-            if (currentState.current_turn === 1) setTimeout(triggerBot, 1500);
+            checkBotTurn(); // Replaces direct setTimeout
         }
     </script>
 </body>

@@ -1,4 +1,5 @@
 import random
+import itertools
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers, models
@@ -10,7 +11,7 @@ from player import Player
 # --- NEURAL NETWORK ARCHITECTURE ---
 def create_advantage_network(input_size=208, hidden_size=256):
     """
-    Input size is now 208: 
+    Input size is 208: 
     52 (Hand) + 52 (Table) + 52 (Dead Cards) + 52 (Action)
     """
     model = models.Sequential([
@@ -67,18 +68,33 @@ class TFDeepCFRBot(Player):
         
         # 1. Singles
         for card in self.hand:
-            if is_valid_beat(evaluate_play([card]), game_state.get('table_eval')):
+            eval_res = evaluate_play([card])
+            if eval_res and is_valid_beat(eval_res, game_state.get('table_eval')):
                 valid_actions.append([card])
                 
-        # 2. Pairs
+        # 2. Pairs (Now properly extracts ALL possible pairs from 3-of-a-kind and 4-of-a-kind)
         rank_groups = {}
         for card in self.hand:
             rank_groups[card[0]] = rank_groups.get(card[0], []) + [card]
             
-        pairs = [cards[:2] for cards in rank_groups.values() if len(cards) >= 2]
-        for pair in pairs:
-            if is_valid_beat(evaluate_play(pair), game_state.get('table_eval')):
-                valid_actions.append(pair)
+        for cards in rank_groups.values():
+            if len(cards) >= 2:
+                # Generate all possible 2-card combinations for this rank
+                for pair in itertools.combinations(cards, 2):
+                    pair_list = list(pair)
+                    eval_res = evaluate_play(pair_list)
+                    if eval_res and is_valid_beat(eval_res, game_state.get('table_eval')):
+                        valid_actions.append(pair_list)
+                        
+        # 3. 5-Card Hands (Straights, Full Houses, Quads, Straight Flushes)
+        if len(self.hand) >= 5:
+            # Generate all possible 5-card combinations from the current hand
+            for combo in itertools.combinations(self.hand, 5):
+                combo_list = list(combo)
+                eval_res = evaluate_play(combo_list)
+                # Only append if it is a legally recognized 5-card hand AND beats the table
+                if eval_res and is_valid_beat(eval_res, game_state.get('table_eval')):
+                    valid_actions.append(combo_list)
                 
         # First turn constraint
         if game_state.get('is_first_turn'):
@@ -100,10 +116,6 @@ class TFDeepCFRBot(Player):
         hand_arr = self._encode_cards(self.hand)
         table_arr = self._encode_cards(game_state.get('table_cards', []))
         dead_arr = self._encode_cards(game_state.get('dead_cards', [])) # Encode discarded cards
-
-        print("[DEBUG] Hand Encoding:", hand_arr)
-        print("[DEBUG] Table Encoding:", table_arr)
-        print("[DEBUG] Dead Cards Encoding:", dead_arr)
         
         # 2. Prepare a single batch of inputs for all legal actions
         batch_inputs = []
