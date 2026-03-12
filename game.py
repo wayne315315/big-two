@@ -2,6 +2,7 @@ import random
 
 from helper import RANKS, SUITS, get_card_value, evaluate_play, is_valid_beat
 from player import HumanPlayer, BotPlayer
+# from tf_deep_cfr_bot import TFDeepCFRBot # Uncomment this to play against the neural network!
 
 # --- GAME ENGINE ---
 def play_game():
@@ -12,7 +13,7 @@ def play_game():
     piles = [deck[i * 13 : (i + 1) * 13] for i in range(4)]
     
     player1 = HumanPlayer("Player 1")
-    player2 = BotPlayer("Big Two Bot")
+    player2 = BotPlayer("Big Two Bot") 
     
     # Assign to 2 players and discard the remaining 2 piles
     player1.receive_cards(piles[0])
@@ -38,11 +39,12 @@ def play_game():
         'table_eval': None,
         'table_cards': [],
         'is_first_turn': True,
-        'lowest_card': lowest_card
+        'lowest_card': lowest_card,
+        'dead_cards': []  # <--- CORRECTED: Starts strictly empty!
     }
     
     last_player_idx = None
-    
+            
     # 2. Main Game Loop
     while True:
         print("\n" + "="*40)
@@ -51,6 +53,9 @@ def play_game():
         # If the turn comes back to the last person who played, they win the trick and clear the table
         if last_player_idx == current_idx:
             print(f"{players[1 - current_idx].name} passed. {current_player.name} takes the table!")
+            # Add the LAST cleared table cards to the dead cards pile
+            if game_state['table_cards']:
+                game_state['dead_cards'].extend(game_state['table_cards'])
             game_state['table_eval'] = None
             game_state['table_cards'] = []
             
@@ -90,6 +95,9 @@ def play_game():
             # Play is valid! Apply to game state.
             print(f"{current_player.name} plays: {', '.join([f'{c[0]}-{c[1][0]}' for c in selected_cards])}")
             current_player.remove_cards(selected_cards)
+            
+            # Move the previously beaten cards to the dead pile before overwriting
+            game_state['dead_cards'].extend(game_state['table_cards'])
             
             game_state['table_eval'] = curr_eval
             game_state['table_cards'] = selected_cards

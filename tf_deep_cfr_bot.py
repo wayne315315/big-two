@@ -8,10 +8,10 @@ from helper import RANKS, SUITS, evaluate_play, is_valid_beat
 from player import Player
 
 # --- NEURAL NETWORK ARCHITECTURE ---
-def create_advantage_network(input_size=156, hidden_size=256):
+def create_advantage_network(input_size=208, hidden_size=256):
     """
-    A Feedforward Neural Network using Keras that predicts the 'regret' 
-    (advantage) of taking a specific action in a specific state.
+    Input size is now 208: 
+    52 (Hand) + 52 (Table) + 52 (Dead Cards) + 52 (Action)
     """
     model = models.Sequential([
         layers.InputLayer(input_shape=(input_size,)),
@@ -23,13 +23,17 @@ def create_advantage_network(input_size=156, hidden_size=256):
 
 # --- DEEP CFR PLAYER IMPLEMENTATION ---
 class TFDeepCFRBot(Player):
-    def __init__(self, name="TF Deep CFR Bot", model_path="tf_advantage_net.weights.h5"):
+    def __init__(self, name="TF Deep CFR Bot", model_path="tf_advantage_net.weights.h5", model=None):
         super().__init__(name)
         self.model_path = model_path
+        self.episode_memory = [] # Added for training directly in the main class
         
-        # Initialize the Keras model
-        self.adv_net = create_advantage_network()
-        self.load_model()
+        # Allow sharing an existing model during self-play training
+        if model is not None:
+            self.adv_net = model
+        else:
+            self.adv_net = create_advantage_network()
+            self.load_model()
 
     def load_model(self):
         """Loads trained weights if available."""
@@ -38,6 +42,10 @@ class TFDeepCFRBot(Player):
             print(f"[{self.name}] TensorFlow Neural Network loaded successfully.")
         except (FileNotFoundError, OSError):
             print(f"[{self.name}] No pre-trained weights found. Using random initialized weights.")
+
+    def clear_memory(self):
+        """Clears the memory for the next game."""
+        self.episode_memory = []
 
     # --- STATE & ACTION ENCODING ---
     def _card_to_index(self, card):
@@ -84,42 +92,46 @@ class TFDeepCFRBot(Player):
         """Uses the Keras Neural Network and Regret Matching to select a play."""
         legal_actions = self._get_legal_actions(game_state)
         
-        if len(legal_actions) == 1:
-            return legal_actions[0] # Forced move
+        # If there is no choice, pick the only action and return (do not record for training)
+        if len(legal_actions) <= 1:
+            return legal_actions[0] if legal_actions else []
             
         # 1. Encode the current environment state
         hand_arr = self._encode_cards(self.hand)
         table_arr = self._encode_cards(game_state.get('table_cards', []))
+        dead_arr = self._encode_cards(game_state.get('dead_cards', [])) # Encode discarded cards
+
+        print("[DEBUG] Hand Encoding:", hand_arr)
+        print("[DEBUG] Table Encoding:", table_arr)
+        print("[DEBUG] Dead Cards Encoding:", dead_arr)
         
-        # 2. Prepare a single batch of inputs for all legal actions (Much faster in TF!)
+        # 2. Prepare a single batch of inputs for all legal actions
         batch_inputs = []
         for action in legal_actions:
             action_arr = self._encode_cards(action)
-            # Concatenate state and action into a single 156-length vector
-            nn_input = np.concatenate([hand_arr, table_arr, action_arr])
+            # Concatenate state and action into a single 208-length vector
+            nn_input = np.concatenate([hand_arr, table_arr, dead_arr, action_arr])
             batch_inputs.append(nn_input)
             
-        # Convert list to a 2D numpy array of shape (num_actions, 156)
         batch_inputs = np.array(batch_inputs)
         
         # 3. Ask the Neural Net for the "Regret" of every possible action at once
         predictions = self.adv_net.predict(batch_inputs, verbose=0)
-        
-        # Flatten the predictions to a 1D list
         advantages = predictions.flatten().tolist()
                 
         # 4. Apply Regret Matching Formula
-        # We only care about POSITIVE regrets. Negative regret means "don't do this".
         positive_advs = [max(a, 0.0) for a in advantages]
         sum_advs = sum(positive_advs)
         
         if sum_advs > 0:
             probabilities = [a / sum_advs for a in positive_advs]
         else:
-            # If the network thinks all moves are bad (or it's untrained), play uniformly random
             probabilities = [1.0 / len(legal_actions)] * len(legal_actions)
             
-        # 5. Sample an action based on the Neural Network's probability distribution
+        # 5. Sample an action based on probabilities
         chosen_index = random.choices(range(len(legal_actions)), weights=probabilities, k=1)[0]
+        
+        # RECORD STATE-ACTION VECTOR FOR TRAINING
+        self.episode_memory.append(batch_inputs[chosen_index])
         
         return legal_actions[chosen_index]

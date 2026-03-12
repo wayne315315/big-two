@@ -21,7 +21,7 @@ def init_game():
     
     # We use the base Player class for the human so it doesn't trigger the terminal input()
     human = Player("Player 1 (You)")
-    bot = BotPlayer("Big Two Bot")
+    bot = TFDeepCFRBot("CFR Bot")
     
     human.receive_cards(piles[0])
     bot.receive_cards(piles[1])
