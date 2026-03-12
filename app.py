@@ -3,7 +3,7 @@ import random
 
 # Import your existing game logic
 from helper import RANKS, SUITS, get_card_value, evaluate_play, is_valid_beat
-from player import Player, BotPlayer
+from player import Player
 from tf_deep_cfr_bot import TFDeepCFRBot
 
 app = Flask(__name__)
@@ -47,7 +47,8 @@ def init_game():
             'table_eval': None,
             'table_cards': [],
             'is_first_turn': True,
-            'lowest_card': lowest_card
+            'lowest_card': lowest_card,
+            'dead_cards': []  # <--- Initialize dead_cards as an empty list
         }
     }
 
@@ -107,6 +108,11 @@ def play_cards():
 
     # Apply valid play
     human.remove_cards(selected_cards)
+    
+    # <--- Sweep the previously beaten cards to the dead pile before overwriting
+    if gs['table_cards']:
+        gs['dead_cards'].extend(gs['table_cards'])
+        
     gs['table_eval'] = curr_eval
     gs['table_cards'] = selected_cards
     gs['is_first_turn'] = False
@@ -155,6 +161,10 @@ def bot_turn():
     curr_eval = evaluate_play(selected_cards)
     bot.remove_cards(selected_cards)
     
+    # <--- Sweep the previously beaten cards to the dead pile before overwriting
+    if gs['table_cards']:
+        gs['dead_cards'].extend(gs['table_cards'])
+        
     gs['table_eval'] = curr_eval
     gs['table_cards'] = selected_cards
     gs['is_first_turn'] = False
@@ -173,10 +183,14 @@ def bot_turn():
 
 def check_table_control():
     """Checks if a player won the trick (the other passed)."""
+    gs = game_instance['game_state_dict']
     if game_instance['last_player_idx'] == game_instance['current_idx']:
-        #game_instance['message'] += " The table is yours!"
-        game_instance['game_state_dict']['table_eval'] = None
-        game_instance['game_state_dict']['table_cards'] = []
+        # <--- The table is won, sweep the remaining table cards to dead cards
+        if gs['table_cards']:
+            gs['dead_cards'].extend(gs['table_cards'])
+            
+        gs['table_eval'] = None
+        gs['table_cards'] = []
 
 if __name__ == '__main__':
     app.run(debug=True)
