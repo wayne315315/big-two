@@ -31,6 +31,10 @@ def train_self_play(episodes=1000, batch_size=64, model_path='tf_advantage_net.w
     metrics = {'p1_wins': 0, 'p2_wins': 0, 'game_lengths': [], 'losses': []}
     start_time = time.time()
 
+    # --- ADDED: Accumulation buffers for batched training ---
+    accumulated_train_x = []
+    accumulated_train_y = []
+
     # 3. Main Training Loop
     for episode in range(1, episodes + 1):
         # Reset deck and hands
@@ -58,7 +62,7 @@ def train_self_play(episodes=1000, batch_size=64, model_path='tf_advantage_net.w
             'table_cards': [],
             'is_first_turn': True,
             'lowest_card': lowest_card,
-            'dead_cards': []  # <--- CORRECTED: Starts strictly empty!
+            'dead_cards': []
         }
         
         last_player_idx = None
@@ -68,7 +72,6 @@ def train_self_play(episodes=1000, batch_size=64, model_path='tf_advantage_net.w
         while True:
             current_player = players[current_idx]
             
-            # If the trick is won, the LAST remaining table cards are swept into the dead/discard pile
             if last_player_idx == current_idx:
                 game_state['dead_cards'].extend(game_state['table_cards'])
                 game_state['table_eval'] = None
@@ -86,6 +89,7 @@ def train_self_play(episodes=1000, batch_size=64, model_path='tf_advantage_net.w
                     
             curr_eval = evaluate_play(selected_cards)
             current_player.remove_cards(selected_cards)
+            
             # Before overwriting the table, move the beaten cards to the dead pile
             game_state['dead_cards'].extend(game_state['table_cards'])
             
@@ -96,13 +100,12 @@ def train_self_play(episodes=1000, batch_size=64, model_path='tf_advantage_net.w
                 
             if not current_player.hand:
                 winner_idx = current_idx
-                # Sweep the final winning play into the dead cards just for completion
                 game_state['dead_cards'].extend(game_state['table_cards'])
                 break
                 
             current_idx = 1 - current_idx
 
-        # --- AFTER GAME: CALCULATE REWARDS AND TRAIN ---
+        # --- AFTER GAME: CALCULATE REWARDS ---
         if winner_idx == 0:
             metrics['p1_wins'] += 1
             p1_reward, p2_reward = 1.0, -1.0
@@ -112,38 +115,56 @@ def train_self_play(episodes=1000, batch_size=64, model_path='tf_advantage_net.w
 
         metrics['game_lengths'].append(turns_played)
 
-        train_x = []
-        train_y = []
-
+        # Append this episode's experience to the accumulation buffers
         for state_action in bot1.episode_memory:
-            train_x.append(state_action)
-            train_y.append(p1_reward)
+            accumulated_train_x.append(state_action)
+            accumulated_train_y.append(p1_reward)
 
         for state_action in bot2.episode_memory:
-            train_x.append(state_action)
-            train_y.append(p2_reward)
+            accumulated_train_x.append(state_action)
+            accumulated_train_y.append(p2_reward)
 
-        if train_x:
-            train_x = np.array(train_x)
-            train_y = np.array(train_y)
-            history = shared_model.fit(train_x, train_y, epochs=1, verbose=0, batch_size=batch_size)
-            metrics['losses'].append(history.history['loss'][0])
+        # --- TRAIN THE NETWORK EVERY 100 EPISODES ---
+        if episode % 100 == 0 or episode == episodes:
+            if accumulated_train_x:
+                train_x = np.array(accumulated_train_x)
+                train_y = np.array(accumulated_train_y)
+                
+                # Shuffle the aggregated batch so the network doesn't overfit to the sequence of games
+                indices = np.arange(len(train_x))
+                np.random.shuffle(indices)
+                train_x = train_x[indices]
+                train_y = train_y[indices]
 
-        if episode % 50 == 0:
-            avg_loss = np.mean(metrics['losses'][-50:]) if metrics['losses'] else 0.0
-            avg_len = np.mean(metrics['game_lengths'][-50:])
+                print("train x shape:", train_x.shape)
+                print("train y shape:", train_y.shape)
+                
+                # Fit the model on the 100-game dataset
+                history = shared_model.fit(train_x, train_y, epochs=1, verbose=0, batch_size=batch_size)
+                metrics['losses'].append(history.history['loss'][0])
+                
+                # Clear the buffer for the next 100 episodes
+                accumulated_train_x = []
+                accumulated_train_y = []
+
+            # Print metrics at the same 100-episode interval
+            num_recent = episode % 100 if episode % 100 != 0 else 100
+            avg_loss = metrics['losses'][-1] if metrics['losses'] else 0.0
+            avg_len = np.mean(metrics['game_lengths'][-num_recent:])
             elapsed = time.time() - start_time
             
             print(f"Episode {episode}/{episodes} | Time: {elapsed:.1f}s")
             print(f"  -> Win Rate: P1 ({metrics['p1_wins']}) vs P2 ({metrics['p2_wins']})")
             print(f"  -> Avg Game Length: {avg_len:.1f} turns")
-            print(f"  -> Avg Neural Net Loss (MSE): {avg_loss:.4f}")
+            print(f"  -> Neural Net Loss (MSE): {avg_loss:.4f}")
             print("-" * 50)
+            
+            # Reset win counters for the next batch
             metrics['p1_wins'] = 0
             metrics['p2_wins'] = 0
 
-    print(f"\nTraining Complete! Saving weights to '{model_path}'...")
-    shared_model.save_weights(model_path)
+            print(f"\nTraining Complete! Saving weights to '{model_path}'...")
+            shared_model.save_weights(model_path)
 
 if __name__ == "__main__":
-    train_self_play(episodes=500)
+    train_self_play(episodes=1000) # Increased to 1000 default to see the batched training behavior
