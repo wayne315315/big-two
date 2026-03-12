@@ -48,7 +48,7 @@ def init_game():
             'table_cards': [],
             'is_first_turn': True,
             'lowest_card': lowest_card,
-            'dead_cards': []  # <--- Initialize dead_cards as an empty list
+            'dead_cards': []  # Starts strictly empty
         }
     }
 
@@ -70,13 +70,24 @@ def get_state():
         init_game()
         
     gs = game_instance['game_state_dict']
+    bot = game_instance['bot']
+    
+    # Calculate the bot's legal actions from its current perspective
+    bot_legal_actions = []
+    is_game_over = len(game_instance['human'].hand) == 0 or len(bot.hand) == 0
+    if not is_game_over:
+        bot_legal_actions = bot._get_legal_actions(gs)
+        
     return jsonify({
         'human_hand': game_instance['human'].hand,
-        'bot_card_count': len(game_instance['bot'].hand),
+        'bot_hand': bot.hand,  # Added to show bot's hand
+        'bot_card_count': len(bot.hand),
         'table_cards': gs['table_cards'],
+        'dead_cards': gs['dead_cards'],  # Added to show dead cards
+        'bot_legal_actions': bot_legal_actions,  # Added to show valid actions
         'current_turn': game_instance['current_idx'], # 0 for Human, 1 for Bot
         'message': game_instance['message'],
-        'is_game_over': len(game_instance['human'].hand) == 0 or len(game_instance['bot'].hand) == 0
+        'is_game_over': is_game_over
     })
 
 @app.route('/api/play', methods=['POST'])
@@ -109,7 +120,7 @@ def play_cards():
     # Apply valid play
     human.remove_cards(selected_cards)
     
-    # <--- Sweep the previously beaten cards to the dead pile before overwriting
+    # Sweep the previously beaten cards to the dead pile before overwriting
     if gs['table_cards']:
         gs['dead_cards'].extend(gs['table_cards'])
         
@@ -161,7 +172,7 @@ def bot_turn():
     curr_eval = evaluate_play(selected_cards)
     bot.remove_cards(selected_cards)
     
-    # <--- Sweep the previously beaten cards to the dead pile before overwriting
+    # Sweep the previously beaten cards to the dead pile before overwriting
     if gs['table_cards']:
         gs['dead_cards'].extend(gs['table_cards'])
         
@@ -185,7 +196,7 @@ def check_table_control():
     """Checks if a player won the trick (the other passed)."""
     gs = game_instance['game_state_dict']
     if game_instance['last_player_idx'] == game_instance['current_idx']:
-        # <--- The table is won, sweep the remaining table cards to dead cards
+        # The table is won, sweep the remaining table cards to dead cards
         if gs['table_cards']:
             gs['dead_cards'].extend(gs['table_cards'])
             

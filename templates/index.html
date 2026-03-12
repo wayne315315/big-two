@@ -3,27 +3,54 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Big Two Web</title>
+    <title>Big Two Web (AI Perspective)</title>
     <style>
         body { font-family: Arial, sans-serif; background-color: #2E4053; color: white; text-align: center; margin: 0; padding: 20px; }
-        .table-area { background-color: #1E8449; border: 5px solid #145A32; border-radius: 15px; padding: 40px; margin: 20px auto; max-width: 800px; min-height: 150px; }
+        
+        .section-title { color: #ECF0F1; font-size: 16px; margin-bottom: 10px; margin-top: 0; border-bottom: 1px solid #7F8C8D; padding-bottom: 5px; }
+        
+        .bot-area { margin: 10px auto; max-width: 800px; padding: 15px; background-color: #34495E; border-radius: 10px; border: 2px solid #7F8C8D; }
+        .dead-cards-area { margin: 10px auto; max-width: 800px; padding: 15px; background-color: #2C3E50; border-radius: 10px; border: 2px solid #95A5A6; text-align: left; }
+        .legal-actions-area { margin: 10px auto; max-width: 800px; padding: 15px; background-color: #1A252F; border-radius: 10px; border: 2px solid #F39C12; text-align: left; }
+        .table-area { background-color: #1E8449; border: 5px solid #145A32; border-radius: 15px; padding: 30px; margin: 20px auto; max-width: 800px; min-height: 120px; }
+        
+        .action-group { display: inline-block; border: 1px dashed #BDC3C7; border-radius: 8px; padding: 5px; margin: 5px; background-color: #34495E; vertical-align: middle;}
+        
         .card { display: inline-block; background-color: white; color: black; border-radius: 8px; width: 60px; height: 90px; margin: 5px; line-height: 90px; font-size: 20px; font-weight: bold; cursor: pointer; user-select: none; box-shadow: 2px 2px 5px rgba(0,0,0,0.3); transition: transform 0.1s; }
         .card.red { color: #E74C3C; }
         .card.selected { transform: translateY(-15px); border: 3px solid #F1C40F; box-sizing: border-box; }
         .card-table { cursor: default; }
+        
+        /* Smaller format for auxiliary display areas */
+        .card.small { width: 40px; height: 60px; line-height: 60px; font-size: 14px; margin: 2px; box-shadow: 1px 1px 3px rgba(0,0,0,0.3); border-radius: 5px; }
+
         .controls { margin-top: 20px; }
         button { padding: 10px 20px; font-size: 16px; font-weight: bold; margin: 5px; cursor: pointer; border-radius: 5px; border: none; }
         .btn-play { background-color: #3498DB; color: white; }
         .btn-pass { background-color: #E74C3C; color: white; }
         .btn-reset { background-color: #95A5A6; color: white; }
         button:disabled { opacity: 0.5; cursor: not-allowed; }
+        
         #message { font-size: 18px; color: #F1C40F; margin-bottom: 15px; font-style: italic; }
     </style>
 </head>
 <body>
 
-    <h2>Bot Cards Remaining: <span id="bot-count">13</span></h2>
-    
+    <div class="bot-area">
+        <h3 class="section-title">Bot's Real-Time Hand (<span id="bot-count">13</span> cards remaining)</h3>
+        <div id="bot-hand"></div>
+    </div>
+
+    <div class="legal-actions-area">
+        <h3 class="section-title">Bot's Calculated Legal Actions (CFR Neural Net Input Options)</h3>
+        <div id="bot-actions"></div>
+    </div>
+
+    <div class="dead-cards-area">
+        <h3 class="section-title">Dead Cards (Discarded / Cleared Tricks)</h3>
+        <div id="dead-cards"></div>
+    </div>
+
     <div class="table-area">
         <div id="message">Loading game...</div>
         <div id="table-cards"></div>
@@ -44,7 +71,6 @@
 
         const suitSymbols = { 'Spades': '♠', 'Hearts': '♥', 'Diamonds': '♦', 'Clubs': '♣' };
 
-        // Fetch the initial game state on load
         window.onload = fetchState;
 
         async function fetchState() {
@@ -52,7 +78,6 @@
             currentState = await response.json();
             renderUI();
             
-            // If it's the bot's turn, trigger bot action after a small delay
             if (currentState.current_turn === 1 && !currentState.is_game_over) {
                 setTimeout(triggerBot, 1500);
             }
@@ -62,39 +87,76 @@
             document.getElementById('bot-count').innerText = currentState.bot_card_count;
             document.getElementById('message').innerText = currentState.message;
             
-            // Render Table Cards
-            const tableDiv = document.getElementById('table-cards');
-            tableDiv.innerHTML = '';
-            if (currentState.table_cards.length === 0) {
-                tableDiv.innerHTML = '<span style="color:#A9DFBF;">[Empty Table]</span>';
+            // Render Bot's Hand (Small)
+            const botHandDiv = document.getElementById('bot-hand');
+            botHandDiv.innerHTML = '';
+            currentState.bot_hand.forEach(card => {
+                botHandDiv.appendChild(createCardHTML(card, false, true));
+            });
+
+            // Render Bot's Legal Actions (Small groups)
+            const botActionsDiv = document.getElementById('bot-actions');
+            botActionsDiv.innerHTML = '';
+            if (currentState.bot_legal_actions.length === 0) {
+                botActionsDiv.innerHTML = '<span style="color:#BDC3C7; font-style:italic;">None (Waiting for turn)</span>';
             } else {
-                currentState.table_cards.forEach(card => {
-                    tableDiv.appendChild(createCardHTML(card, false));
+                currentState.bot_legal_actions.forEach(action => {
+                    const actionDiv = document.createElement('div');
+                    actionDiv.className = 'action-group';
+                    if (action.length === 0) {
+                        actionDiv.innerHTML = '<span style="color:#E74C3C; padding: 0 5px; font-weight:bold;">[ PASS ]</span>';
+                    } else {
+                        action.forEach(card => {
+                            actionDiv.appendChild(createCardHTML(card, false, true));
+                        });
+                    }
+                    botActionsDiv.appendChild(actionDiv);
                 });
             }
 
-            // Render Human Hand
+            // Render Dead Cards (Small)
+            const deadCardsDiv = document.getElementById('dead-cards');
+            deadCardsDiv.innerHTML = '';
+            if (currentState.dead_cards.length === 0) {
+                deadCardsDiv.innerHTML = '<span style="color:#BDC3C7; font-style:italic;">No cards discarded yet.</span>';
+            } else {
+                currentState.dead_cards.forEach(card => {
+                    deadCardsDiv.appendChild(createCardHTML(card, false, true));
+                });
+            }
+
+            // Render Table Cards (Normal Size)
+            const tableDiv = document.getElementById('table-cards');
+            tableDiv.innerHTML = '';
+            if (currentState.table_cards.length === 0) {
+                tableDiv.innerHTML = '<span style="color:#A9DFBF;">[Empty Table - Free Play]</span>';
+            } else {
+                currentState.table_cards.forEach(card => {
+                    tableDiv.appendChild(createCardHTML(card, false, false));
+                });
+            }
+
+            // Render Human Hand (Clickable, Normal Size)
             const handDiv = document.getElementById('human-hand');
             handDiv.innerHTML = '';
-            selectedCards = []; // clear selection on UI refresh
-            currentState.human_hand.forEach((card, index) => {
-                const cardEl = createCardHTML(card, true, index);
-                handDiv.appendChild(cardEl);
+            selectedCards = []; 
+            currentState.human_hand.forEach(card => {
+                handDiv.appendChild(createCardHTML(card, true, false));
             });
 
-            // Update button states
             const isMyTurn = (currentState.current_turn === 0 && !currentState.is_game_over);
             document.getElementById('btn-play').disabled = !isMyTurn;
             document.getElementById('btn-pass').disabled = !isMyTurn;
         }
 
-        function createCardHTML(cardData, isClickable, index = -1) {
+        // Adjusted createCardHTML to accept an isSmall boolean
+        function createCardHTML(cardData, isClickable, isSmall) {
             const rank = cardData[0];
             const suit = cardData[1];
             const isRed = (suit === 'Hearts' || suit === 'Diamonds');
             
             const el = document.createElement('div');
-            el.className = 'card' + (isRed ? ' red' : '') + (isClickable ? '' : ' card-table');
+            el.className = 'card' + (isRed ? ' red' : '') + (isClickable ? '' : ' card-table') + (isSmall ? ' small' : '');
             el.innerHTML = rank + suitSymbols[suit];
             
             if (isClickable) {
@@ -104,7 +166,7 @@
         }
 
         function toggleSelection(element, cardData) {
-            if (currentState.current_turn !== 0) return; // Only allow selection on your turn
+            if (currentState.current_turn !== 0) return; 
             
             const idx = selectedCards.findIndex(c => c[0] === cardData[0] && c[1] === cardData[1]);
             if (idx > -1) {
@@ -160,7 +222,6 @@
             currentState = await response.json();
             renderUI();
             
-            // If bot won the trick and goes again
             if (currentState.current_turn === 1 && !currentState.is_game_over) {
                 setTimeout(triggerBot, 1500);
             }
