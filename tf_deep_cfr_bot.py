@@ -52,10 +52,11 @@ def create_advantage_network(input_size=208, hidden_size=512, num_res_blocks=3):
 
 # --- DEEP CFR PLAYER IMPLEMENTATION ---
 class TFDeepCFRBot(Player):
-    def __init__(self, name="TF Deep CFR Bot", model_path="tf_advantage_net.weights.h5", model=None):
+    def __init__(self, name="TF Deep CFR Bot", model_path="tf_advantage_net.weights.h5", model=None, exploration_rate=0.1):
         super().__init__(name)
         self.model_path = model_path
         self.episode_memory = [] # Added for training directly in the main class
+        self.exploration_rate = exploration_rate
         
         # Allow sharing an existing model during self-play training
         if model is not None:
@@ -168,6 +169,11 @@ class TFDeepCFRBot(Player):
             probabilities = [a / sum_advs for a in positive_advs]
         else:
             probabilities = [1.0 / len(legal_actions)] * len(legal_actions)
+
+        # --- ADDED: EXPLORATION POLICY MIXING ---
+        if self.exploration_rate > 0:
+            explore_prob = self.exploration_rate / len(legal_actions)
+            probabilities = [(p * (1.0 - self.exploration_rate)) + explore_prob for p in probabilities]
             
         # 5. Sample an action based on probabilities
         chosen_index = random.choices(range(len(legal_actions)), weights=probabilities, k=1)[0]

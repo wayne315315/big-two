@@ -24,7 +24,7 @@ def test_model(num_games=100, model_path="tf_advantage_net.weights.h5"):
     print("="*50)
     
     # 1. Initialize bots ONCE outside the loop so we don't reload the Keras model 100 times!
-    cfr_bot = TFDeepCFRBot(name="TF Deep CFR Bot", model_path=model_path)
+    cfr_bot = TFDeepCFRBot(name="TF Deep CFR Bot", model_path=model_path, exploration_rate=0.0)
     standard_bot = BotPlayer("Standard Bot")
     
     cfr_wins = 0
