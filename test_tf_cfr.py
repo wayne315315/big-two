@@ -71,6 +71,7 @@ def test_model(num_games=100, model_path="tf_advantage_net.weights.h5"):
                 current_player = players[current_idx]
                 
                 if last_player_idx == current_idx:
+                    game_state['dead_cards'].extend(game_state['table_cards'])
                     game_state['table_eval'] = None
                     game_state['table_cards'] = []
                     
@@ -94,6 +95,7 @@ def test_model(num_games=100, model_path="tf_advantage_net.weights.h5"):
                     
                 if not current_player.hand:
                     winner_idx = current_idx
+                    game_state['dead_cards'].extend(game_state['table_cards'])
                     break
                     
                 current_idx = 1 - current_idx
