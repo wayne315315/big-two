@@ -59,7 +59,8 @@ def test_model(num_games=100, model_path="tf_advantage_net.weights.h5"):
             'table_eval': None,
             'table_cards': [],
             'is_first_turn': True,
-            'lowest_card': lowest_card
+            'lowest_card': lowest_card,
+            'dead_cards': [] 
         }
         
         last_player_idx = None
@@ -84,6 +85,7 @@ def test_model(num_games=100, model_path="tf_advantage_net.weights.h5"):
                         
                 curr_eval = evaluate_play(selected_cards)
                 current_player.remove_cards(selected_cards)
+                game_state['dead_cards'].extend(game_state['table_cards'])
                 
                 game_state['table_eval'] = curr_eval
                 game_state['table_cards'] = selected_cards

@@ -196,14 +196,14 @@ def train_self_play(total_episodes=2000, batch_size=64, model_path='tf_advantage
             train_y = train_y[indices]
 
             # Fit the model
-            history = shared_model.fit(train_x, train_y, epochs=100, verbose=0, batch_size=batch_size)
+            history = shared_model.fit(train_x, train_y, epochs=2, verbose=0, batch_size=batch_size)
             metrics['losses'].append(history.history['loss'][0])
             
             # Flush updated weights to disk so the next round of actors pick them up!
             shared_model.save_weights(model_path)
 
             # Test
-            test_model(num_games=100)
+            test_model(num_games=1000)
 
         episodes_completed += episodes_per_update
 
@@ -228,4 +228,4 @@ def train_self_play(total_episodes=2000, batch_size=64, model_path='tf_advantage
 if __name__ == "__main__":
     # Ensure Windows/Mac compatibility with multiprocessing
     mp.freeze_support()
-    train_self_play(total_episodes=2000000, episodes_per_update=1000, batch_size=512)
+    train_self_play(total_episodes=2000000, episodes_per_update=10000, batch_size=1024)
