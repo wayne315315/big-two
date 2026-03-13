@@ -1,42 +1,37 @@
+import os
+import time
 import random
 import numpy as np
+import multiprocessing as mp
 import tensorflow as tf
 from tensorflow.keras import optimizers
-import time
 
 from helper import RANKS, SUITS, get_card_value, evaluate_play
 from tf_deep_cfr_bot import TFDeepCFRBot, create_advantage_network
 
-def train_self_play(episodes=1000, batch_size=64, model_path='tf_advantage_net.weights.h5'):
-    print("="*50)
-    print("INITIALIZING DEEP CFR SELF-PLAY TRAINING (TENSORFLOW)")
-    print("="*50)
+# ==============================================================================
+# THE CLIENT (ACTOR WORKER)
+# This function runs isolated in parallel sub-processes. We force it to use 
+# the CPU so that parallel workers don't fight over GPU VRAM.
+# ==============================================================================
+def worker_generate_batch(num_games, model_path):
+    # Force workers to use CPU for generation to prevent GPU OOM crashes
+    os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+    # Suppress verbose TF logging in workers
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
 
-    # 1. Create the shared Neural Network and the optimizer
-    shared_model = create_advantage_network()
-    try:
-        shared_model.load_weights(model_path)  # Load existing weights if available
-        print(f"Loaded existing weights from '{model_path}'")
-    except (FileNotFoundError, OSError):
-        print(f"No existing weights found at '{model_path}', starting with random weights.")
-
-    optimizer = optimizers.Adam(learning_rate=0.001)
-    shared_model.compile(optimizer=optimizer, loss='mse')
-
-    # 2. Setup the training bots (Directly passing the shared model)
-    bot1 = TFDeepCFRBot("Player 1", model=shared_model)
-    bot2 = TFDeepCFRBot("Player 2", model=shared_model)
+    # Initialize isolated bots for this specific process
+    bot1 = TFDeepCFRBot("Player 1", model_path=model_path)
+    bot2 = TFDeepCFRBot("Player 2", model_path=model_path)
     players = [bot1, bot2]
 
-    metrics = {'p1_wins': 0, 'p2_wins': 0, 'game_lengths': [], 'losses': []}
-    start_time = time.time()
-
-    # --- ADDED: Accumulation buffers for batched training ---
     accumulated_train_x = []
     accumulated_train_y = []
+    p1_wins = 0
+    p2_wins = 0
+    game_lengths = []
 
-    # 3. Main Training Loop
-    for episode in range(1, episodes + 1):
+    for _ in range(num_games):
         # Reset deck and hands
         deck = [(rank, suit) for rank in RANKS for suit in SUITS]
         random.shuffle(deck)
@@ -107,15 +102,15 @@ def train_self_play(episodes=1000, batch_size=64, model_path='tf_advantage_net.w
 
         # --- AFTER GAME: CALCULATE REWARDS ---
         if winner_idx == 0:
-            metrics['p1_wins'] += 1
+            p1_wins += 1
             p1_reward, p2_reward = 1.0, -1.0
         else:
-            metrics['p2_wins'] += 1
+            p2_wins += 1
             p1_reward, p2_reward = -1.0, 1.0
 
-        metrics['game_lengths'].append(turns_played)
+        game_lengths.append(turns_played)
 
-        # Append this episode's experience to the accumulation buffers
+        # Append this episode's experience
         for state_action in bot1.episode_memory:
             accumulated_train_x.append(state_action)
             accumulated_train_y.append(p1_reward)
@@ -124,47 +119,109 @@ def train_self_play(episodes=1000, batch_size=64, model_path='tf_advantage_net.w
             accumulated_train_x.append(state_action)
             accumulated_train_y.append(p2_reward)
 
-        # --- TRAIN THE NETWORK EVERY 100 EPISODES ---
-        if episode % 100 == 0 or episode == episodes:
-            if accumulated_train_x:
-                train_x = np.array(accumulated_train_x)
-                train_y = np.array(accumulated_train_y)
-                
-                # Shuffle the aggregated batch so the network doesn't overfit to the sequence of games
-                indices = np.arange(len(train_x))
-                np.random.shuffle(indices)
-                train_x = train_x[indices]
-                train_y = train_y[indices]
+    return accumulated_train_x, accumulated_train_y, p1_wins, p2_wins, game_lengths
 
-                print("train x shape:", train_x.shape)
-                print("train y shape:", train_y.shape)
-                
-                # Fit the model on the 100-game dataset
-                history = shared_model.fit(train_x, train_y, epochs=1, verbose=0, batch_size=batch_size)
-                metrics['losses'].append(history.history['loss'][0])
-                
-                # Clear the buffer for the next 100 episodes
-                accumulated_train_x = []
-                accumulated_train_y = []
 
-            # Print metrics at the same 100-episode interval
-            num_recent = episode % 100 if episode % 100 != 0 else 100
-            avg_loss = metrics['losses'][-1] if metrics['losses'] else 0.0
-            avg_len = np.mean(metrics['game_lengths'][-num_recent:])
-            elapsed = time.time() - start_time
+# ==============================================================================
+# THE SERVER (LEARNER MASTER)
+# Orchestrates workers, gathers data, and trains on the GPU.
+# ==============================================================================
+def train_self_play(total_episodes=2000, batch_size=64, model_path='tf_advantage_net.weights.h5', num_workers=None, episodes_per_update=100):
+    print("="*60)
+    print("INITIALIZING DISTRIBUTED DEEP CFR (TENSORFLOW)")
+    print("="*60)
+    
+    if num_workers is None:
+        num_workers = max(1, mp.cpu_count() - 1)  # Leave 1 core for the master process
+        
+    print(f"Server Architecture: 1 Learner (GPU/Main) | {num_workers} Actors (CPU Workers)")
+
+    # 1. Create the Master Neural Network
+    shared_model = create_advantage_network()
+    try:
+        shared_model.load_weights(model_path)
+        print(f"Loaded existing weights from '{model_path}'")
+    except (FileNotFoundError, OSError):
+        print(f"No existing weights found at '{model_path}', starting with random weights.")
+
+    optimizer = optimizers.Adam(learning_rate=1e-4)
+    shared_model.compile(optimizer=optimizer, loss='mse')
+
+    # Save initial weights immediately so workers have a file to load
+    shared_model.save_weights(model_path)
+
+    metrics = {'p1_wins': 0, 'p2_wins': 0, 'game_lengths': [], 'losses': []}
+    start_time = time.time()
+
+    # Use 'spawn' to ensure TensorFlow state is not corrupted during process fork
+    ctx = mp.get_context('spawn')
+    
+    episodes_completed = 0
+
+    # 2. Main Distributed Loop
+    while episodes_completed < total_episodes:
+        # Calculate how to distribute the games across our CPU workers
+        base_games = episodes_per_update // num_workers
+        remainder = episodes_per_update % num_workers
+        worker_tasks = [base_games + (1 if i < remainder else 0) for i in range(num_workers)]
+
+        accumulated_train_x = []
+        accumulated_train_y = []
+
+        # Dispatch Tasks to Actors
+        with ctx.Pool(processes=num_workers) as pool:
+            # We use apply_async to fire them off in parallel
+            results = [pool.apply_async(worker_generate_batch, args=(games, model_path)) 
+                       for games in worker_tasks if games > 0]
             
-            print(f"Episode {episode}/{episodes} | Time: {elapsed:.1f}s")
-            print(f"  -> Win Rate: P1 ({metrics['p1_wins']}) vs P2 ({metrics['p2_wins']})")
-            print(f"  -> Avg Game Length: {avg_len:.1f} turns")
-            print(f"  -> Neural Net Loss (MSE): {avg_loss:.4f}")
-            print("-" * 50)
-            
-            # Reset win counters for the next batch
-            metrics['p1_wins'] = 0
-            metrics['p2_wins'] = 0
+            # Wait and harvest data
+            for r in results:
+                x, y, p1w, p2w, gl = r.get()
+                accumulated_train_x.extend(x)
+                accumulated_train_y.extend(y)
+                metrics['p1_wins'] += p1w
+                metrics['p2_wins'] += p2w
+                metrics['game_lengths'].extend(gl)
 
-            print(f"\nTraining Complete! Saving weights to '{model_path}'...")
+        # 3. Master Training Node (Learner)
+        if accumulated_train_x:
+            train_x = np.array(accumulated_train_x)
+            train_y = np.array(accumulated_train_y)
+            
+            # Shuffle batch
+            indices = np.arange(len(train_x))
+            np.random.shuffle(indices)
+            train_x = train_x[indices]
+            train_y = train_y[indices]
+
+            # Fit the model
+            history = shared_model.fit(train_x, train_y, epochs=100, verbose=0, batch_size=batch_size)
+            metrics['losses'].append(history.history['loss'][0])
+            
+            # Flush updated weights to disk so the next round of actors pick them up!
             shared_model.save_weights(model_path)
 
+        episodes_completed += episodes_per_update
+
+        # Print Analytics
+        avg_loss = metrics['losses'][-1] if metrics['losses'] else 0.0
+        avg_len = np.mean(metrics['game_lengths'][-episodes_per_update:])
+        elapsed = time.time() - start_time
+        
+        print(f"Episodes {episodes_completed}/{total_episodes} | Time: {elapsed:.1f}s")
+        print(f"  -> Win Rate: P1 ({metrics['p1_wins']}) vs P2 ({metrics['p2_wins']})")
+        print(f"  -> Avg Game Length: {avg_len:.1f} turns")
+        print(f"  -> Train Batch Size: {len(train_x)} samples")
+        print(f"  -> Neural Net Loss (MSE): {avg_loss:.4f}")
+        print("-" * 60)
+        
+        # Reset counters for the next batch
+        metrics['p1_wins'] = 0
+        metrics['p2_wins'] = 0
+
+    print(f"\nTraining Complete! Final weights secured at '{model_path}'...")
+
 if __name__ == "__main__":
-    train_self_play(episodes=1000) # Increased to 1000 default to see the batched training behavior
+    # Ensure Windows/Mac compatibility with multiprocessing
+    mp.freeze_support()
+    train_self_play(total_episodes=2000000, episodes_per_update=1000, batch_size=512)

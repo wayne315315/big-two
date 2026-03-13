@@ -8,19 +8,47 @@ from tensorflow.keras import layers, models
 from helper import RANKS, SUITS, evaluate_play, is_valid_beat
 from player import Player
 
+
 # --- NEURAL NETWORK ARCHITECTURE ---
-def create_advantage_network(input_size=208, hidden_size=256):
+def create_advantage_network(input_size=208, hidden_size=512, num_res_blocks=3):
     """
-    Input size is 208: 
-    52 (Hand) + 52 (Table) + 52 (Dead Cards) + 52 (Action)
+    Advanced Deep Residual Network for Deep CFR.
+    - Wider & Deeper to prevent underfitting.
+    - BatchNorm to prevent overfitting.
     """
-    model = models.Sequential([
-        layers.InputLayer(input_shape=(input_size,)),
-        layers.Dense(hidden_size, activation='relu'),
-        layers.Dense(hidden_size, activation='relu'),
-        layers.Dense(1) # Outputs a single regret value
-    ])
-    return model
+    inputs = layers.Input(shape=(input_size,))
+    
+    # 1. Initial Projection Layer (Expands the 208 bits into 512 features)
+    x = layers.Dense(hidden_size)(inputs)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation('relu')(x)
+
+    # 2. Residual Blocks (Allows deep networks to train without vanishing gradients)
+    for _ in range(num_res_blocks):
+        residual = x  # Save the input to skip across the block
+        
+        # First half of the block
+        x = layers.Dense(hidden_size)(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.Activation('relu')(x)
+        
+        # Second half of the block
+        x = layers.Dense(hidden_size)(x)
+        x = layers.BatchNormalization()(x)
+        
+        # Add the original input back in (The "Skip Connection")
+        x = layers.Add()([x, residual]) 
+        x = layers.Activation('relu')(x)
+
+    # 3. Value Head (Compresses the complex features down to a single regret value)
+    x = layers.Dense(128, activation='relu')(x)
+    x = layers.BatchNormalization()(x)
+    
+    # Final Output (Linear activation for continuous Regret values)
+    outputs = layers.Dense(1)(x)
+
+    return models.Model(inputs=inputs, outputs=outputs)
+
 
 # --- DEEP CFR PLAYER IMPLEMENTATION ---
 class TFDeepCFRBot(Player):
@@ -40,9 +68,10 @@ class TFDeepCFRBot(Player):
         """Loads trained weights if available."""
         try:
             self.adv_net.load_weights(self.model_path)
-            print(f"[{self.name}] TensorFlow Neural Network loaded successfully.")
+            #print(f"[{self.name}] TensorFlow Neural Network loaded successfully.")
         except (FileNotFoundError, OSError):
-            print(f"[{self.name}] No pre-trained weights found. Using random initialized weights.")
+            pass
+            #print(f"[{self.name}] No pre-trained weights found. Using random initialized weights.")
 
     def clear_memory(self):
         """Clears the memory for the next game."""
