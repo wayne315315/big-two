@@ -8,6 +8,7 @@ from tensorflow.keras import optimizers
 
 from helper import RANKS, SUITS, get_card_value, evaluate_play
 from tf_deep_cfr_bot import TFDeepCFRBot, create_advantage_network
+from test_tf_cfr import test_model
 
 # ==============================================================================
 # THE CLIENT (ACTOR WORKER)
@@ -200,6 +201,9 @@ def train_self_play(total_episodes=2000, batch_size=64, model_path='tf_advantage
             
             # Flush updated weights to disk so the next round of actors pick them up!
             shared_model.save_weights(model_path)
+
+            # Test
+            test_model(num_games=100)
 
         episodes_completed += episodes_per_update
 
