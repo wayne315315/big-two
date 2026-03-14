@@ -170,6 +170,10 @@ def train_self_play(total_episodes=2000, batch_size=64, model_path='tf_advantage
         remainder = episodes_per_update % num_workers
         worker_tasks = [base_games + (1 if i < remainder else 0) for i in range(num_workers)]
 
+        # --- NEW: Temporary arrays for Latest Experience Injection ---
+        accumulated_new_x = []
+        accumulated_new_y = []
+
         # Dispatch Tasks to Actors
         with ctx.Pool(processes=num_workers) as pool:
             results = [pool.apply_async(worker_generate_batch, args=(games, model_path)) 
@@ -179,13 +183,15 @@ def train_self_play(total_episodes=2000, batch_size=64, model_path='tf_advantage
             for r in results:
                 x, y, p1w, p2w, gl = r.get()
                 
+                # 1. Store strictly NEW data for guaranteed training this round
+                accumulated_new_x.extend(x)
+                accumulated_new_y.extend(y)
+                
                 metrics['p1_wins'] += p1w
                 metrics['p2_wins'] += p2w
                 metrics['game_lengths'].extend(gl)
 
-                # ==========================================================
-                # --- ADDED: RESERVOIR SAMPLING LOGIC ---
-                # ==========================================================
+                # 2. Add to Reservoir (Unchanged)
                 for i in range(len(x)):
                     total_games_generated += 1
                     
@@ -200,17 +206,38 @@ def train_self_play(total_episodes=2000, batch_size=64, model_path='tf_advantage
                             # Overwrite an old memory with the new one
                             replay_buffer_x[replace_idx] = x[i]
                             replay_buffer_y[replace_idx] = y[i]
+
         # 3. Master Training Node (Learner)
         if replay_buffer_x:
-            # --- THE FIX: Randomly sample a mini-batch from the reservoir! ---
-            # Max sample size of 32,000 prevents the network from memorizing the buffer
-            sample_size = min(len(replay_buffer_x), 32000) 
+            # --- THE INJECTION FIX ---
+            # Start the training batch with 100% of the newly generated data
+            train_x_list = list(accumulated_new_x)
+            train_y_list = list(accumulated_new_y)
             
-            # Get random unique indices
-            indices = np.random.choice(len(replay_buffer_x), sample_size, replace=False)
+            # Calculate how much old data we need to reach the 32,000 batch size
+            target_batch_size = 32000
+            historical_needed = target_batch_size - len(train_x_list)
             
-            train_x = np.array([replay_buffer_x[i] for i in indices])
-            train_y = np.array([replay_buffer_y[i] for i in indices])
+            if historical_needed > 0 and len(replay_buffer_x) > 0:
+                # Protect against requesting more historical data than we actually possess
+                historical_needed = min(historical_needed, len(replay_buffer_x))
+                
+                # Sample the remaining quota from the historical reservoir
+                indices = np.random.choice(len(replay_buffer_x), historical_needed, replace=False)
+                for idx in indices:
+                    train_x_list.append(replay_buffer_x[idx])
+                    train_y_list.append(replay_buffer_y[idx])
+            
+            # Convert to numpy arrays
+            train_x = np.array(train_x_list)
+            train_y = np.array(train_y_list)
+
+            # --- CRITICAL: SHUFFLE THE COMBINED BATCH ---
+            # We must shuffle so the network doesn't see all "new" data first and "old" data second
+            shuffle_indices = np.arange(len(train_x))
+            np.random.shuffle(shuffle_indices)
+            train_x = train_x[shuffle_indices]
+            train_y = train_y[shuffle_indices]
 
             # Fit the model (Epochs = 1 is MANDATORY to prevent overfitting)
             history = shared_model.fit(train_x, train_y, epochs=1, verbose=0, batch_size=batch_size)
