@@ -122,7 +122,6 @@ def worker_generate_batch(num_games, model_path):
 
     return accumulated_train_x, accumulated_train_y, p1_wins, p2_wins, game_lengths
 
-
 # ==============================================================================
 # THE SERVER (LEARNER MASTER)
 # Orchestrates workers, gathers data, and trains on the GPU.
@@ -154,55 +153,73 @@ def train_self_play(total_episodes=2000, batch_size=64, model_path='tf_advantage
     metrics = {'p1_wins': 0, 'p2_wins': 0, 'game_lengths': [], 'losses': []}
     start_time = time.time()
 
-    # Use 'spawn' to ensure TensorFlow state is not corrupted during process fork
     ctx = mp.get_context('spawn')
-    
     episodes_completed = 0
+
+    # ==========================================================
+    # --- ADDED: RESERVOIR SAMPLING REPLAY BUFFER SETUP ---
+    # ==========================================================
+    MAX_BUFFER_SIZE = 200000
+    replay_buffer_x = []
+    replay_buffer_y = []
+    total_games_generated = 0  # Tracks the total number of actions ever generated
 
     # 2. Main Distributed Loop
     while episodes_completed < total_episodes:
-        # Calculate how to distribute the games across our CPU workers
         base_games = episodes_per_update // num_workers
         remainder = episodes_per_update % num_workers
         worker_tasks = [base_games + (1 if i < remainder else 0) for i in range(num_workers)]
 
-        accumulated_train_x = []
-        accumulated_train_y = []
-
         # Dispatch Tasks to Actors
         with ctx.Pool(processes=num_workers) as pool:
-            # We use apply_async to fire them off in parallel
             results = [pool.apply_async(worker_generate_batch, args=(games, model_path)) 
                        for games in worker_tasks if games > 0]
             
             # Wait and harvest data
             for r in results:
                 x, y, p1w, p2w, gl = r.get()
-                accumulated_train_x.extend(x)
-                accumulated_train_y.extend(y)
+                
                 metrics['p1_wins'] += p1w
                 metrics['p2_wins'] += p2w
                 metrics['game_lengths'].extend(gl)
 
+                # ==========================================================
+                # --- ADDED: RESERVOIR SAMPLING LOGIC ---
+                # ==========================================================
+                for i in range(len(x)):
+                    total_games_generated += 1
+                    
+                    if len(replay_buffer_x) < MAX_BUFFER_SIZE:
+                        # Buffer isn't full yet, just append
+                        replay_buffer_x.append(x[i])
+                        replay_buffer_y.append(y[i])
+                    else:
+                        # Buffer is full, run the reservoir math
+                        replace_idx = random.randint(0, total_games_generated - 1)
+                        if replace_idx < MAX_BUFFER_SIZE:
+                            # Overwrite an old memory with the new one
+                            replay_buffer_x[replace_idx] = x[i]
+                            replay_buffer_y[replace_idx] = y[i]
         # 3. Master Training Node (Learner)
-        if accumulated_train_x:
-            train_x = np.array(accumulated_train_x)
-            train_y = np.array(accumulated_train_y)
+        if replay_buffer_x:
+            # --- THE FIX: Randomly sample a mini-batch from the reservoir! ---
+            # Max sample size of 32,000 prevents the network from memorizing the buffer
+            sample_size = min(len(replay_buffer_x), 32000) 
             
-            # Shuffle batch
-            indices = np.arange(len(train_x))
-            np.random.shuffle(indices)
-            train_x = train_x[indices]
-            train_y = train_y[indices]
+            # Get random unique indices
+            indices = np.random.choice(len(replay_buffer_x), sample_size, replace=False)
+            
+            train_x = np.array([replay_buffer_x[i] for i in indices])
+            train_y = np.array([replay_buffer_y[i] for i in indices])
 
-            # Fit the model
-            history = shared_model.fit(train_x, train_y, epochs=2, verbose=0, batch_size=batch_size)
+            # Fit the model (Epochs = 1 is MANDATORY to prevent overfitting)
+            history = shared_model.fit(train_x, train_y, epochs=1, verbose=0, batch_size=batch_size)
             metrics['losses'].append(history.history['loss'][0])
             
-            # Flush updated weights to disk so the next round of actors pick them up!
+            # Flush updated weights to disk so actors pick them up!
             shared_model.save_weights(model_path)
 
-            # Test
+            # Test benchmark
             test_model(num_games=100)
 
         episodes_completed += episodes_per_update
@@ -215,7 +232,7 @@ def train_self_play(total_episodes=2000, batch_size=64, model_path='tf_advantage
         print(f"Episodes {episodes_completed}/{total_episodes} | Time: {elapsed:.1f}s")
         print(f"  -> Win Rate: P1 ({metrics['p1_wins']}) vs P2 ({metrics['p2_wins']})")
         print(f"  -> Avg Game Length: {avg_len:.1f} turns")
-        print(f"  -> Train Batch Size: {len(train_x)} samples")
+        print(f"  -> Replay Buffer Size: {len(replay_buffer_x)} / {MAX_BUFFER_SIZE}")
         print(f"  -> Neural Net Loss (MSE): {avg_loss:.4f}")
         print("-" * 60)
         
