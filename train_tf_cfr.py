@@ -203,7 +203,7 @@ def train_self_play(total_episodes=2000, batch_size=64, model_path='tf_advantage
             shared_model.save_weights(model_path)
 
             # Test
-            test_model(num_games=1000)
+            test_model(num_games=100)
 
         episodes_completed += episodes_per_update
 
@@ -228,4 +228,4 @@ def train_self_play(total_episodes=2000, batch_size=64, model_path='tf_advantage
 if __name__ == "__main__":
     # Ensure Windows/Mac compatibility with multiprocessing
     mp.freeze_support()
-    train_self_play(total_episodes=2000000, episodes_per_update=10000, batch_size=1024)
+    train_self_play(total_episodes=2000000, episodes_per_update=1000, batch_size=1024)
