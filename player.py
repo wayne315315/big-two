@@ -94,11 +94,11 @@ class BotPlayer(Player):
         return valid_actions
 
     def get_play(self, game_state):
-        print(f"\n--- {self.name}'s Turn (Bot) ---")
+        #print(f"\n--- {self.name}'s Turn (Bot) ---")
         
         # 1. First Turn Constraint
         if game_state['is_first_turn']:
-            print(f"{self.name} automatically plays the starting card.")
+            #print(f"{self.name} automatically plays the starting card.")
             return [game_state['lowest_card']]
 
         # 2. Analyze Hand for basic combinations

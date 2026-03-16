@@ -9,7 +9,7 @@ from player import Player
 
 # --- NEURAL NETWORK ARCHITECTURES ---
 def create_advantage_network(input_size=208, hidden_size=512, num_res_blocks=3):
-    """Predicts the Regret of taking an action."""
+    """Predicts the True Regret of taking an action."""
     inputs = layers.Input(shape=(input_size,))
     x = layers.Dense(hidden_size)(inputs)
     x = layers.BatchNormalization()(x)
@@ -54,28 +54,26 @@ def create_policy_network(input_size=208, hidden_size=512, num_res_blocks=3):
 
     return models.Model(inputs=inputs, outputs=outputs)
 
-# --- TRUE DEEP CFR PLAYER ---
+# --- TRUE DEEP CFR PLAYER (CLIENT ENABLED) ---
 class TFDeepCFRBot(Player):
     def __init__(self, name="TF Deep CFR Bot", adv_model_path="tf_advantage_net.weights.h5", 
-                 policy_model_path="tf_policy_net.weights.h5", is_training=True, exploration_rate=0.1):
+                 policy_model_path="tf_policy_net.weights.h5", is_training=True, exploration_rate=0.1, pipe=None):
         super().__init__(name)
-        self.adv_model_path = adv_model_path
-        self.policy_model_path = policy_model_path
         self.is_training = is_training
         self.exploration_rate = exploration_rate if is_training else 0.0
+        self.pipe = pipe  # IPC Communication Pipe
         
-        self.episode_memory = [] # For Regret
-        self.policy_memory = []  # For Average Strategy
+        self.episode_memory = [] 
+        self.policy_memory = []  
         
-        self.adv_net = create_advantage_network()
-        self.policy_net = create_policy_network()
-        self.load_models()
-
-    def load_models(self):
-        try: self.adv_net.load_weights(self.adv_model_path)
-        except: pass
-        try: self.policy_net.load_weights(self.policy_model_path)
-        except: pass
+        # If no pipe is provided, run as a standalone bot (loads weights into local memory)
+        if self.pipe is None:
+            self.adv_net = create_advantage_network()
+            self.policy_net = create_policy_network()
+            try: self.adv_net.load_weights(adv_model_path)
+            except: pass
+            try: self.policy_net.load_weights(policy_model_path)
+            except: pass
 
     def clear_memory(self):
         self.episode_memory = []
@@ -94,16 +92,13 @@ class TFDeepCFRBot(Player):
 
     def _get_legal_actions(self, game_state):
         valid_actions = [[]] if game_state.get('table_eval') else []
-        
         for card in self.hand:
             eval_res = evaluate_play([card])
             if eval_res and is_valid_beat(eval_res, game_state.get('table_eval')):
                 valid_actions.append([card])
-                
         rank_groups = {}
         for card in self.hand:
             rank_groups[card[0]] = rank_groups.get(card[0], []) + [card]
-            
         for cards in rank_groups.values():
             if len(cards) >= 2:
                 for pair in itertools.combinations(cards, 2):
@@ -111,18 +106,15 @@ class TFDeepCFRBot(Player):
                     eval_res = evaluate_play(pair_list)
                     if eval_res and is_valid_beat(eval_res, game_state.get('table_eval')):
                         valid_actions.append(pair_list)
-                        
         if len(self.hand) >= 5:
             for combo in itertools.combinations(self.hand, 5):
                 combo_list = list(combo)
                 eval_res = evaluate_play(combo_list)
                 if eval_res and is_valid_beat(eval_res, game_state.get('table_eval')):
                     valid_actions.append(combo_list)
-                
         if game_state.get('is_first_turn'):
             req_card = game_state['lowest_card']
             valid_actions = [a for a in valid_actions if req_card in a]
-            
         return valid_actions
 
     def get_play(self, game_state):
@@ -142,17 +134,17 @@ class TFDeepCFRBot(Player):
         batch_inputs = np.array(batch_inputs)
         
         if self.is_training:
-            # Phase 1: Exploration and Regret Calculation
-            predictions = self.adv_net.predict(batch_inputs, verbose=0)
-            advantages = predictions.flatten().tolist()
+            if self.pipe:
+                self.pipe.send((False, batch_inputs)) # False indicates Advantage Network Request
+                advantages = self.pipe.recv().flatten().tolist()
+            else:
+                advantages = self.adv_net(batch_inputs, training=False).numpy().flatten().tolist()
                     
             positive_advs = [max(a, 0.0) for a in advantages]
             sum_advs = sum(positive_advs)
             
-            if sum_advs > 0:
-                probabilities = [a / sum_advs for a in positive_advs]
-            else:
-                probabilities = [1.0 / len(legal_actions)] * len(legal_actions)
+            if sum_advs > 0: probabilities = [a / sum_advs for a in positive_advs]
+            else: probabilities = [1.0 / len(legal_actions)] * len(legal_actions)
 
             if self.exploration_rate > 0:
                 explore_prob = self.exploration_rate / len(legal_actions)
@@ -161,25 +153,22 @@ class TFDeepCFRBot(Player):
                 final_probs = probabilities
                 
             chosen_index = random.choices(range(len(legal_actions)), weights=final_probs, k=1)[0]
-            
-            # Baseline V(s) calculation
             state_value = sum([p * adv for p, adv in zip(probabilities, advantages)])
             
             self.episode_memory.append({
-                'inputs': batch_inputs,
-                'chosen_index': chosen_index,
-                'baseline_value': state_value
+                'inputs': batch_inputs, 'chosen_index': chosen_index, 'baseline_value': state_value
             })
-            
-            # Target probabilities for Average Policy Network
             for i in range(len(legal_actions)):
                 self.policy_memory.append((batch_inputs[i], probabilities[i]))
-            
             return legal_actions[chosen_index]
-        else:
-            # Phase 2: Pure Exploitation using the Nash Equilibrium
-            predictions = self.policy_net.predict(batch_inputs, verbose=0)
-            policy_probs = predictions.flatten().tolist()
             
+        else:
+            # Policy Network Exploitation (Benchmark Mode)
+            if self.pipe:
+                self.pipe.send((True, batch_inputs)) # True indicates Policy Network Request
+                policy_probs = self.pipe.recv().flatten().tolist()
+            else:
+                policy_probs = self.policy_net(batch_inputs, training=False).numpy().flatten().tolist()
+                
             best_action_idx = np.argmax(policy_probs)
             return legal_actions[best_action_idx]
