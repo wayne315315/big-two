@@ -1,9 +1,7 @@
 import os
 import time
 import random
-import sys
 import multiprocessing as mp
-import threading
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import tensorflow as tf
@@ -13,10 +11,16 @@ from player import BotPlayer
 from tf_deep_cfr_bot import TFDeepCFRBot, create_policy_network
 
 # ==============================================================================
-# THE GPU INFERENCE SERVER (TESTING MODE)
+# THE GPU INFERENCE SERVER (TESTING MODE + XLA COMPILATION)
 # ==============================================================================
 def gpu_inference_server(conns, pol_net):
-    """Continuously polls pipes, batches data, and evaluates on the GPU."""
+    """Dynamic GPU Batching specifically for the Policy Network."""
+    
+    # Define a strict input signature to prevent recompilation delays when batch size fluctuates
+    @tf.function(input_signature=[tf.TensorSpec(shape=(None, 208), dtype=tf.float32)])
+    def fast_pol_infer(batch):
+        return pol_net(batch, training=False)
+
     active_conns = list(conns)
     while active_conns:
         pol_reqs, pol_pipes, pol_lens = [], [], []
@@ -31,7 +35,6 @@ def gpu_inference_server(conns, pol_net):
                         active_conns.remove(conn)
                     else:
                         is_policy, inputs = msg
-                        # Testing mode only ever requests the Policy Network
                         if is_policy:  
                             pol_reqs.append(inputs)
                             pol_pipes.append(conn)
@@ -43,10 +46,9 @@ def gpu_inference_server(conns, pol_net):
             time.sleep(0.001)
             continue
 
-        # GPU Dynamic Batching
         if pol_reqs:
             batch = np.concatenate(pol_reqs, axis=0)
-            preds = pol_net(tf.convert_to_tensor(batch), training=False).numpy()
+            preds = fast_pol_infer(tf.convert_to_tensor(batch)).numpy() # Fast compiled infer
             idx = 0
             for c, length in zip(pol_pipes, pol_lens):
                 c.send(preds[idx : idx + length])
@@ -56,7 +58,8 @@ def gpu_inference_server(conns, pol_net):
 # INTRA-PROCESS THREAD LOGIC (GAME SIMULATION)
 # ==============================================================================
 def _thread_test_games(num_games, conn):
-    """The isolated game loop executed by individual threads."""
+    """Tests the fully trained bot against the Standard Bot."""
+    # is_training=False unlocks the Average Policy Network and sets exploration to 0.0
     cfr_bot = TFDeepCFRBot("CFR Bot", pipe=conn, is_training=False)
     standard_bot = BotPlayer("Standard Bot")
     
@@ -114,8 +117,7 @@ def _thread_test_games(num_games, conn):
 # CPU MULTIPROCESS MANAGERS
 # ==============================================================================
 def distributed_test_worker(num_games, conns, result_queue):
-    """Process Manager: Spawns threads to overlap Python processing with GPU Wait times."""
-    os.environ['CUDA_VISIBLE_DEVICES'] = '-1' # Blind the actor to GPU
+    os.environ['CUDA_VISIBLE_DEVICES'] = '-1' 
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
     
     threads_count = len(conns)
@@ -124,7 +126,6 @@ def distributed_test_worker(num_games, conns, result_queue):
     thread_tasks = [base_games + (1 if i < remainder else 0) for i in range(threads_count)]
 
     results = []
-    # Utilize Python threads to hide IPC and GPU latency
     with ThreadPoolExecutor(max_workers=threads_count) as executor:
         futures = []
         for i in range(threads_count):
@@ -140,16 +141,16 @@ def distributed_test_worker(num_games, conns, result_queue):
         total_std_wins += sw
 
     for conn in conns:
-        conn.send("DONE") # Tell the server this worker is finished
+        conn.send("DONE") 
 
     result_queue.put((total_cfr_wins, total_std_wins))
 
 # ==============================================================================
 # MAIN TEST ORCHESTRATOR
 # ==============================================================================
-def test_model(num_games=1000, policy_path="tf_policy_net.weights.h5", num_workers=None, threads_per_worker=4):
+def test_model(num_games=1000, policy_path="tf_policy_model.keras", num_workers=None, threads_per_worker=100):
     print("="*60)
-    print(f"DISTRIBUTED MULTI-THREADED GPU BENCHMARK ({num_games} GAMES)")
+    print(f"DISTRIBUTED FLOAT32 GPU BENCHMARK ({num_games} GAMES)")
     print("="*60)
     
     if num_workers is None:
@@ -159,32 +160,28 @@ def test_model(num_games=1000, policy_path="tf_policy_net.weights.h5", num_worke
     print(f"Spawning {num_workers} processes x {threads_per_worker} threads ({total_threads} virtual actors) utilizing 1 GPU...")
     start_time = time.time()
     
-    # Initialize GPU Policy Network (Testing does not require the Advantage Network)
-    shared_pol_net = create_policy_network()
+    # OPTIMIZATION: Load the full compiled model safely for testing
     try:
-        shared_pol_net.load_weights(policy_path)
-        print(f"Successfully loaded '{policy_path}'")
+        shared_pol_net = tf.keras.models.load_model(policy_path, compile=False)
+        print(f"Successfully loaded full model '{policy_path}'")
     except:
         print(f"Warning: Could not load '{policy_path}'. Using random weights.")
+        shared_pol_net = create_policy_network()
         
     ctx = mp.get_context('spawn')
     
-    # Distribute games evenly across processes
     base_games = num_games // num_workers
     remainder = num_games % num_workers
     test_tasks = [base_games + (1 if i < remainder else 0) for i in range(num_workers)]
     
-    # Create a massive bank of pipes (1 for every thread)
     pipes = [ctx.Pipe() for _ in range(total_threads)]
     parent_conns = [p[0] for p in pipes]
     child_conns = [p[1] for p in pipes]
     
-    # Group the child pipes into chunks for the processes
     child_conn_chunks = [child_conns[i * threads_per_worker : (i + 1) * threads_per_worker] for i in range(num_workers)]
     
     result_queue = ctx.Queue()
 
-    # Start Worker Processes
     processes = []
     for i, task_count in enumerate(test_tasks):
         if task_count > 0:
@@ -192,10 +189,8 @@ def test_model(num_games=1000, policy_path="tf_policy_net.weights.h5", num_worke
             p.start()
             processes.append(p)
 
-    # Run GPU Inference Server (Blocks until all workers send "DONE")
     gpu_inference_server(parent_conns, shared_pol_net)
 
-    # Harvest Results
     total_cfr_wins, total_std_wins = 0, 0
     for _ in range(len(processes)):
         cw, sw = result_queue.get()
@@ -216,5 +211,4 @@ def test_model(num_games=1000, policy_path="tf_policy_net.weights.h5", num_worke
 
 if __name__ == "__main__":
     mp.freeze_support()
-    # Set to run a 1,000-game test. You can easily bump this to 5,000 or 10,000.
     test_model(num_games=1000, threads_per_worker=100)
