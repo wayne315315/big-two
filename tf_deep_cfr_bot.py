@@ -4,88 +4,88 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers, models
 
-# Import your existing, unmodified logic
 from helper import RANKS, SUITS, evaluate_play, is_valid_beat
 from player import Player
 
-
-# --- NEURAL NETWORK ARCHITECTURE ---
+# --- NEURAL NETWORK ARCHITECTURES ---
 def create_advantage_network(input_size=208, hidden_size=512, num_res_blocks=3):
-    """
-    Advanced Deep Residual Network for Deep CFR.
-    - Wider & Deeper to prevent underfitting.
-    - BatchNorm to prevent overfitting.
-    """
+    """Predicts the Regret of taking an action."""
     inputs = layers.Input(shape=(input_size,))
-    
-    # 1. Initial Projection Layer (Expands the 208 bits into 512 features)
     x = layers.Dense(hidden_size)(inputs)
     x = layers.BatchNormalization()(x)
     x = layers.Activation('relu')(x)
 
-    # 2. Residual Blocks (Allows deep networks to train without vanishing gradients)
     for _ in range(num_res_blocks):
-        residual = x  # Save the input to skip across the block
-        
-        # First half of the block
+        residual = x
         x = layers.Dense(hidden_size)(x)
         x = layers.BatchNormalization()(x)
         x = layers.Activation('relu')(x)
-        
-        # Second half of the block
         x = layers.Dense(hidden_size)(x)
         x = layers.BatchNormalization()(x)
-        
-        # Add the original input back in (The "Skip Connection")
         x = layers.Add()([x, residual]) 
         x = layers.Activation('relu')(x)
 
-    # 3. Value Head (Compresses the complex features down to a single regret value)
     x = layers.Dense(128, activation='relu')(x)
     x = layers.BatchNormalization()(x)
-    
-    # Final Output (Linear activation for continuous Regret values)
-    outputs = layers.Dense(1)(x)
+    outputs = layers.Dense(1)(x) # Linear output for continuous regret
 
     return models.Model(inputs=inputs, outputs=outputs)
 
+def create_policy_network(input_size=208, hidden_size=512, num_res_blocks=3):
+    """Predicts the average optimal probability of taking an action (Nash Equilibrium)."""
+    inputs = layers.Input(shape=(input_size,))
+    x = layers.Dense(hidden_size)(inputs)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation('relu')(x)
 
-# --- DEEP CFR PLAYER IMPLEMENTATION ---
+    for _ in range(num_res_blocks):
+        residual = x
+        x = layers.Dense(hidden_size)(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.Activation('relu')(x)
+        x = layers.Dense(hidden_size)(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.Add()([x, residual]) 
+        x = layers.Activation('relu')(x)
+
+    x = layers.Dense(128, activation='relu')(x)
+    x = layers.BatchNormalization()(x)
+    outputs = layers.Dense(1, activation='sigmoid')(x) # Sigmoid output for probabilities
+
+    return models.Model(inputs=inputs, outputs=outputs)
+
+# --- TRUE DEEP CFR PLAYER ---
 class TFDeepCFRBot(Player):
-    def __init__(self, name="TF Deep CFR Bot", model_path="tf_advantage_net.weights.h5", model=None, exploration_rate=0.1):
+    def __init__(self, name="TF Deep CFR Bot", adv_model_path="tf_advantage_net.weights.h5", 
+                 policy_model_path="tf_policy_net.weights.h5", is_training=True, exploration_rate=0.1):
         super().__init__(name)
-        self.model_path = model_path
-        self.episode_memory = [] # Added for training directly in the main class
-        self.exploration_rate = exploration_rate
+        self.adv_model_path = adv_model_path
+        self.policy_model_path = policy_model_path
+        self.is_training = is_training
+        self.exploration_rate = exploration_rate if is_training else 0.0
         
-        # Allow sharing an existing model during self-play training
-        if model is not None:
-            self.adv_net = model
-        else:
-            self.adv_net = create_advantage_network()
-            self.load_model()
+        self.episode_memory = [] # For Regret
+        self.policy_memory = []  # For Average Strategy
+        
+        self.adv_net = create_advantage_network()
+        self.policy_net = create_policy_network()
+        self.load_models()
 
-    def load_model(self):
-        """Loads trained weights if available."""
-        try:
-            self.adv_net.load_weights(self.model_path)
-            #print(f"[{self.name}] TensorFlow Neural Network loaded successfully.")
-        except (FileNotFoundError, OSError):
-            pass
-            #print(f"[{self.name}] No pre-trained weights found. Using random initialized weights.")
+    def load_models(self):
+        try: self.adv_net.load_weights(self.adv_model_path)
+        except: pass
+        try: self.policy_net.load_weights(self.policy_model_path)
+        except: pass
 
     def clear_memory(self):
-        """Clears the memory for the next game."""
         self.episode_memory = []
+        self.policy_memory = []
 
-    # --- STATE & ACTION ENCODING ---
     def _card_to_index(self, card):
-        """Maps a card tuple ('3', 'Clubs') to a unique integer 0-51."""
         rank, suit = card
         return RANKS.index(rank) * 4 + SUITS.index(suit)
 
     def _encode_cards(self, cards):
-        """Converts a list of cards into a 52-dimensional one-hot numpy array."""
         array = np.zeros(52, dtype=np.float32)
         if cards:
             for card in cards:
@@ -93,92 +93,93 @@ class TFDeepCFRBot(Player):
         return array
 
     def _get_legal_actions(self, game_state):
-        """Generates all legally valid combinations we can play."""
         valid_actions = [[]] if game_state.get('table_eval') else []
         
-        # 1. Singles
         for card in self.hand:
             eval_res = evaluate_play([card])
             if eval_res and is_valid_beat(eval_res, game_state.get('table_eval')):
                 valid_actions.append([card])
                 
-        # 2. Pairs (Now properly extracts ALL possible pairs from 3-of-a-kind and 4-of-a-kind)
         rank_groups = {}
         for card in self.hand:
             rank_groups[card[0]] = rank_groups.get(card[0], []) + [card]
             
         for cards in rank_groups.values():
             if len(cards) >= 2:
-                # Generate all possible 2-card combinations for this rank
                 for pair in itertools.combinations(cards, 2):
                     pair_list = list(pair)
                     eval_res = evaluate_play(pair_list)
                     if eval_res and is_valid_beat(eval_res, game_state.get('table_eval')):
                         valid_actions.append(pair_list)
                         
-        # 3. 5-Card Hands (Straights, Full Houses, Quads, Straight Flushes)
         if len(self.hand) >= 5:
-            # Generate all possible 5-card combinations from the current hand
             for combo in itertools.combinations(self.hand, 5):
                 combo_list = list(combo)
                 eval_res = evaluate_play(combo_list)
-                # Only append if it is a legally recognized 5-card hand AND beats the table
                 if eval_res and is_valid_beat(eval_res, game_state.get('table_eval')):
                     valid_actions.append(combo_list)
                 
-        # First turn constraint
         if game_state.get('is_first_turn'):
             req_card = game_state['lowest_card']
             valid_actions = [a for a in valid_actions if req_card in a]
             
         return valid_actions
 
-    # --- THE CORE DECISION LOGIC ---
     def get_play(self, game_state):
-        """Uses the Keras Neural Network and Regret Matching to select a play."""
         legal_actions = self._get_legal_actions(game_state)
         
-        # If there is no choice, pick the only action and return (do not record for training)
         if len(legal_actions) <= 1:
             return legal_actions[0] if legal_actions else []
             
-        # 1. Encode the current environment state
         hand_arr = self._encode_cards(self.hand)
         table_arr = self._encode_cards(game_state.get('table_cards', []))
-        dead_arr = self._encode_cards(game_state.get('dead_cards', [])) # Encode discarded cards
+        dead_arr = self._encode_cards(game_state.get('dead_cards', []))
         
-        # 2. Prepare a single batch of inputs for all legal actions
         batch_inputs = []
         for action in legal_actions:
             action_arr = self._encode_cards(action)
-            # Concatenate state and action into a single 208-length vector
-            nn_input = np.concatenate([hand_arr, table_arr, dead_arr, action_arr])
-            batch_inputs.append(nn_input)
-            
+            batch_inputs.append(np.concatenate([hand_arr, table_arr, dead_arr, action_arr]))
         batch_inputs = np.array(batch_inputs)
         
-        # 3. Ask the Neural Net for the "Regret" of every possible action at once
-        predictions = self.adv_net.predict(batch_inputs, verbose=0)
-        advantages = predictions.flatten().tolist()
-                
-        # 4. Apply Regret Matching Formula
-        positive_advs = [max(a, 0.0) for a in advantages]
-        sum_advs = sum(positive_advs)
-        
-        if sum_advs > 0:
-            probabilities = [a / sum_advs for a in positive_advs]
-        else:
-            probabilities = [1.0 / len(legal_actions)] * len(legal_actions)
-
-        # --- ADDED: EXPLORATION POLICY MIXING ---
-        if self.exploration_rate > 0:
-            explore_prob = self.exploration_rate / len(legal_actions)
-            probabilities = [(p * (1.0 - self.exploration_rate)) + explore_prob for p in probabilities]
+        if self.is_training:
+            # Phase 1: Exploration and Regret Calculation
+            predictions = self.adv_net.predict(batch_inputs, verbose=0)
+            advantages = predictions.flatten().tolist()
+                    
+            positive_advs = [max(a, 0.0) for a in advantages]
+            sum_advs = sum(positive_advs)
             
-        # 5. Sample an action based on probabilities
-        chosen_index = random.choices(range(len(legal_actions)), weights=probabilities, k=1)[0]
-        
-        # RECORD STATE-ACTION VECTOR FOR TRAINING
-        self.episode_memory.append(batch_inputs[chosen_index])
-        
-        return legal_actions[chosen_index]
+            if sum_advs > 0:
+                probabilities = [a / sum_advs for a in positive_advs]
+            else:
+                probabilities = [1.0 / len(legal_actions)] * len(legal_actions)
+
+            if self.exploration_rate > 0:
+                explore_prob = self.exploration_rate / len(legal_actions)
+                final_probs = [(p * (1.0 - self.exploration_rate)) + explore_prob for p in probabilities]
+            else:
+                final_probs = probabilities
+                
+            chosen_index = random.choices(range(len(legal_actions)), weights=final_probs, k=1)[0]
+            
+            # Baseline V(s) calculation
+            state_value = sum([p * adv for p, adv in zip(probabilities, advantages)])
+            
+            self.episode_memory.append({
+                'inputs': batch_inputs,
+                'chosen_index': chosen_index,
+                'baseline_value': state_value
+            })
+            
+            # Target probabilities for Average Policy Network
+            for i in range(len(legal_actions)):
+                self.policy_memory.append((batch_inputs[i], probabilities[i]))
+            
+            return legal_actions[chosen_index]
+        else:
+            # Phase 2: Pure Exploitation using the Nash Equilibrium
+            predictions = self.policy_net.predict(batch_inputs, verbose=0)
+            policy_probs = predictions.flatten().tolist()
+            
+            best_action_idx = np.argmax(policy_probs)
+            return legal_actions[best_action_idx]
