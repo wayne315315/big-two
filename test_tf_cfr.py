@@ -2,6 +2,7 @@ import os
 import time
 import random
 import multiprocessing as mp
+import multiprocessing.connection # <-- NEW: OS-level polling
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import tensorflow as tf
@@ -14,41 +15,49 @@ from tf_deep_cfr_bot import TFDeepCFRBot, create_policy_network
 # THE GPU INFERENCE SERVER (TESTING MODE + XLA COMPILATION)
 # ==============================================================================
 def gpu_inference_server(conns, pol_net):
-    """Dynamic GPU Batching specifically for the Policy Network."""
+    """Dynamic GPU Batching specifically for the Policy Network using wait() micro-batching."""
     
-    # Define a strict input signature to prevent recompilation delays when batch size fluctuates
     @tf.function(input_signature=[tf.TensorSpec(shape=(None, 208), dtype=tf.float32)])
     def fast_pol_infer(batch):
         return pol_net(batch, training=False)
 
     active_conns = list(conns)
+    MAX_GPU_BATCH = 16384
+
     while active_conns:
         pol_reqs, pol_pipes, pol_lens = [], [], []
-        processed_any = False
         
-        for conn in active_conns[:]: 
-            if conn.poll(): 
-                processed_any = True
-                try:
-                    msg = conn.recv()
-                    if msg == "DONE":
-                        active_conns.remove(conn)
-                    else:
-                        is_policy, inputs = msg
-                        if is_policy:  
-                            pol_reqs.append(inputs)
-                            pol_pipes.append(conn)
-                            pol_lens.append(len(inputs))
-                except EOFError:
-                    active_conns.remove(conn)
+        ready_conns = []
+        for i in range(0, len(active_conns), 500):
+            chunk = active_conns[i : i+500]
+            ready_conns.extend(multiprocessing.connection.wait(chunk, timeout=0.001))
         
-        if not processed_any:
+        if not ready_conns:
             time.sleep(0.001)
             continue
-
+            
+        for conn in ready_conns:
+            try:
+                msg = conn.recv()
+                if msg == "DONE":
+                    active_conns.remove(conn)
+                else:
+                    is_policy, inputs = msg
+                    if is_policy:  
+                        pol_reqs.append(inputs)
+                        pol_pipes.append(conn)
+                        pol_lens.append(len(inputs))
+            except EOFError:
+                if conn in active_conns:
+                    active_conns.remove(conn)
+        
         if pol_reqs:
             batch = np.concatenate(pol_reqs, axis=0)
-            preds = fast_pol_infer(tf.convert_to_tensor(batch)).numpy() # Fast compiled infer
+            preds = []
+            for i in range(0, len(batch), MAX_GPU_BATCH):
+                preds.append(fast_pol_infer(tf.convert_to_tensor(batch[i:i+MAX_GPU_BATCH])).numpy())
+            preds = np.concatenate(preds, axis=0)
+            
             idx = 0
             for c, length in zip(pol_pipes, pol_lens):
                 c.send(preds[idx : idx + length])
@@ -59,7 +68,6 @@ def gpu_inference_server(conns, pol_net):
 # ==============================================================================
 def _thread_test_games(num_games, conn):
     """Tests the fully trained bot against the Standard Bot."""
-    # is_training=False unlocks the Average Policy Network and sets exploration to 0.0
     cfr_bot = TFDeepCFRBot("CFR Bot", pipe=conn, is_training=False)
     standard_bot = BotPlayer("Standard Bot")
     
@@ -160,7 +168,6 @@ def test_model(num_games=1000, policy_path="tf_policy_model.keras", num_workers=
     print(f"Spawning {num_workers} processes x {threads_per_worker} threads ({total_threads} virtual actors) utilizing 1 GPU...")
     start_time = time.time()
     
-    # OPTIMIZATION: Load the full compiled model safely for testing
     try:
         shared_pol_net = tf.keras.models.load_model(policy_path, compile=False)
         print(f"Successfully loaded full model '{policy_path}'")
@@ -211,4 +218,4 @@ def test_model(num_games=1000, policy_path="tf_policy_model.keras", num_workers=
 
 if __name__ == "__main__":
     mp.freeze_support()
-    test_model(num_games=1000, threads_per_worker=100)
+    test_model(num_games=10000, threads_per_worker=1000)

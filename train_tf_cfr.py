@@ -4,6 +4,7 @@ import random
 import pickle
 import numpy as np
 import multiprocessing as mp
+import multiprocessing.connection  # <-- NEW: OS-level polling
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import tensorflow as tf
@@ -19,11 +20,9 @@ from test_tf_cfr import test_model
 # ==============================================================================
 def gpu_inference_server(conns, adv_net, pol_net):
     """
-    Listens to all CPU threads. When requests arrive, it stacks them into a
-    single giant tensor matrix and runs one lightning-fast GPU prediction.
+    Listens to all CPU threads using C-level wait() and micro-batching.
+    Stacks requests into a giant tensor matrix and runs lightning-fast GPU predictions.
     """
-    # GRAPH COMPILATION: Compiles the Python inference into fused C++/CUDA graphs.
-    # input_signature locks the shape so TensorFlow doesn't re-compile when batch sizes fluctuate.
     @tf.function(input_signature=[tf.TensorSpec(shape=(None, 208), dtype=tf.float32)])
     def fast_adv_infer(batch):
         return adv_net(batch, training=False)
@@ -33,50 +32,64 @@ def gpu_inference_server(conns, adv_net, pol_net):
         return pol_net(batch, training=False)
 
     active_conns = list(conns)
+    MAX_GPU_BATCH = 16384  # Safety net to prevent VRAM crashes on massive batches
+
     while active_conns:
         adv_reqs, adv_pipes, adv_lens = [], [], []
         pol_reqs, pol_pipes, pol_lens = [], [], []
-        processed_any = False
         
-        # Poll all pipes to see who needs math done
-        for conn in active_conns[:]: 
-            if conn.poll(): 
-                processed_any = True
-                try:
-                    msg = conn.recv()
-                    if msg == "DONE":
-                        active_conns.remove(conn) # Thread is finished
-                    else:
-                        is_policy, inputs = msg
-                        if is_policy:
-                            pol_reqs.append(inputs)
-                            pol_pipes.append(conn)
-                            pol_lens.append(len(inputs))
-                        else:
-                            adv_reqs.append(inputs)
-                            adv_pipes.append(conn)
-                            adv_lens.append(len(inputs))
-                except EOFError:
-                    active_conns.remove(conn)
+        # 1. ULTRA-FAST C-LEVEL POLLING (The Fix for Low GPU Util)
+        # We chunk the pipes into groups of 500 to avoid OS limits (MacOS limits file descriptors to 1024)
+        ready_conns = []
+        for i in range(0, len(active_conns), 500):
+            chunk = active_conns[i : i+500]
+            # timeout=0.001 acts as a micro-batching window, letting data pile up in the pipes!
+            ready_conns.extend(multiprocessing.connection.wait(chunk, timeout=0.001))
         
-        # If no one is asking for math, sleep for 1ms to prevent CPU lockup
-        if not processed_any:
+        if not ready_conns:
             time.sleep(0.001)
             continue
+            
+        # Harvest data instantly from all ready connections
+        for conn in ready_conns: 
+            try:
+                msg = conn.recv()
+                if msg == "DONE":
+                    active_conns.remove(conn)
+                else:
+                    is_policy, inputs = msg
+                    if is_policy:
+                        pol_reqs.append(inputs)
+                        pol_pipes.append(conn)
+                        pol_lens.append(len(inputs))
+                    else:
+                        adv_reqs.append(inputs)
+                        adv_pipes.append(conn)
+                        adv_lens.append(len(inputs))
+            except EOFError:
+                if conn in active_conns:
+                    active_conns.remove(conn)
 
-        # Process Advantage Network requests on GPU
+        # 2. RUN BATCHED GPU INFERENCE
         if adv_reqs:
-            batch = np.concatenate(adv_reqs, axis=0) # Stack into 1 matrix
-            preds = fast_adv_infer(tf.convert_to_tensor(batch)).numpy() # Fast compiled infer
+            batch = np.concatenate(adv_reqs, axis=0)
+            preds = []
+            for i in range(0, len(batch), MAX_GPU_BATCH):
+                preds.append(fast_adv_infer(tf.convert_to_tensor(batch[i:i+MAX_GPU_BATCH])).numpy())
+            preds = np.concatenate(preds, axis=0)
+            
             idx = 0
             for c, length in zip(adv_pipes, adv_lens):
-                c.send(preds[idx : idx + length]) # Send answers back to the correct thread
+                c.send(preds[idx : idx + length])
                 idx += length
                 
-        # Process Policy Network requests on GPU
         if pol_reqs:
             batch = np.concatenate(pol_reqs, axis=0)
-            preds = fast_pol_infer(tf.convert_to_tensor(batch)).numpy()
+            preds = []
+            for i in range(0, len(batch), MAX_GPU_BATCH):
+                preds.append(fast_pol_infer(tf.convert_to_tensor(batch[i:i+MAX_GPU_BATCH])).numpy())
+            preds = np.concatenate(preds, axis=0)
+            
             idx = 0
             for c, length in zip(pol_pipes, pol_lens):
                 c.send(preds[idx : idx + length])
@@ -162,7 +175,6 @@ def _thread_simulate_games(num_games, conn, current_episode, total_episodes):
         game_lengths.append(turns_played)
 
         # DEEP CFR MATH: Calculate True Regret (Reward - Baseline Value)
-        # This explicit regret tracking is authentic MCCFR methodology!
         for step in bot1.episode_memory:
             accumulated_train_x.append(step['inputs'][step['chosen_index']])
             accumulated_train_y.append(p1_reward - step['baseline_value'])
@@ -183,7 +195,6 @@ def _thread_simulate_games(num_games, conn, current_episode, total_episodes):
 def worker_generate_batch(num_games, conns, result_queue, current_episode, total_episodes):
     """
     Process Manager: Spawns overlapping threads to hide the GPU I/O latency.
-    When Thread A is frozen waiting for the GPU, Thread B runs the Python game logic.
     """
     os.environ['CUDA_VISIBLE_DEVICES'] = '-1' # Blind the CPU to the GPU to prevent RAM crashes
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
@@ -230,7 +241,7 @@ def worker_generate_batch(num_games, conns, result_queue, current_episode, total
 # ==============================================================================
 def train_self_play(total_episodes=2000000, batch_size=1024, adv_path='tf_advantage_model.keras', pol_path='tf_policy_model.keras', buffer_path='cfr_replay_buffers.pkl', num_workers=None, threads_per_worker=100, episodes_per_update=1000):
     print("="*60)
-    print("INITIALIZING PIPED GPU-INFERENCE CFR (FULL STATE RESUME)")
+    print("INITIALIZING PIPED GPU-INFERENCE CFR (FULL STATE RESUME + MICRO-BATCHING)")
     print("="*60)
     
     if num_workers is None: num_workers = max(1, mp.cpu_count() - 1)
@@ -240,8 +251,6 @@ def train_self_play(total_episodes=2000000, batch_size=1024, adv_path='tf_advant
     # ==========================================================================
     # LOAD FULL MODELS & OPTIMIZERS
     # ==========================================================================
-    # We load the ENTIRE model (Architecture + Weights + Adam Optimizer State)
-    # This prevents the devastating "Resume-Spike" when restarting the script.
     try:
         shared_adv_net = tf.keras.models.load_model(adv_path)
         shared_pol_net = tf.keras.models.load_model(pol_path)
@@ -289,8 +298,6 @@ def train_self_play(total_episodes=2000000, batch_size=1024, adv_path='tf_advant
         # ======================================================================
         # DETERMINISTIC LEARNING RATE INJECTION (Keras 3 Compatible)
         # ======================================================================
-        # Guarantees the learning rate is perfectly synced to the bot's age.
-        # Uses direct assignment compatible with TensorFlow 2.18.1 (Keras 3 API)
         decay_cycles = episodes_completed // 10000
         current_lr = max(1e-6, 1e-4 * (0.96 ** decay_cycles))
         
@@ -357,7 +364,6 @@ def train_self_play(total_episodes=2000000, batch_size=1024, adv_path='tf_advant
             # ==================================================================
             # ADVANTAGE TRAINING (The Teacher Learns Regrets)
             # ==================================================================
-            # Latest Experience Injection: Combine 100% of new games with random history
             train_adv_x_list, train_adv_y_list = list(acc_new_adv_x), list(acc_new_adv_y)
             hist_needed_adv = min(target_batch_size - len(train_adv_x_list), len(replay_buffer_x))
             if hist_needed_adv > 0:
@@ -430,4 +436,4 @@ def train_self_play(total_episodes=2000000, batch_size=1024, adv_path='tf_advant
 if __name__ == "__main__":
     mp.freeze_support()
     # threads_per_worker parameter controls how many overlapping threads spawn per core to max out the GPU
-    train_self_play(total_episodes=2000000, episodes_per_update=1000, batch_size=1024, threads_per_worker=100)
+    train_self_play(total_episodes=2000000, episodes_per_update=10000, batch_size=8192, threads_per_worker=1000)
