@@ -333,7 +333,7 @@ def train_self_play(total_episodes=2000000, batch_size=1024, adv_path='tf_advant
         avg_adv = metrics['adv_losses'][-1] if metrics['adv_losses'] else 0.0
         avg_pol = metrics['pol_losses'][-1] if metrics['pol_losses'] else 0.0
         avg_len = np.mean(metrics['game_lengths'][-episodes_per_update:])
-        test_model(num_games=1000, threads_per_worker=100)
+        test_model(num_games=100, threads_per_worker=10)
         elapsed = time.time() - start_time
         
         print(f"Episodes {episodes_completed}/{total_episodes} | Time: {elapsed:.1f}s")
