@@ -19,15 +19,36 @@ from tf_deep_cfr_bot import TFDeepCFRBot, create_advantage_network, create_polic
 from test_tf_cfr import test_model
 
 # ==============================================================================
+# FAST MEMORY BUFFER INSERTION 
+# ==============================================================================
+def add_to_buffer(buffer_x, buffer_y, new_x, new_y, current_size, max_size):
+    n = len(new_x)
+    if n == 0: return current_size
+    if current_size + n <= max_size:
+        buffer_x[current_size:current_size+n] = new_x
+        buffer_y[current_size:current_size+n] = new_y
+        return current_size + n
+    else:
+        rem = max_size - current_size
+        if rem > 0:
+            buffer_x[current_size:max_size] = new_x[:rem]
+            buffer_y[current_size:max_size] = new_y[:rem]
+        n_left = n - rem
+        if n_left > 0:
+            replace_idx = np.random.randint(0, max_size, size=n_left)
+            buffer_x[replace_idx] = new_x[rem:]
+            buffer_y[replace_idx] = new_y[rem:]
+        return max_size
+
+# ==============================================================================
 # THE GPU INFERENCE SERVER (STATIC XLA BUFFERING)
 # ==============================================================================
-# BOTTLECK FIX 3: Moved tf.function definitions OUTSIDE the server so they don't recompile
 def gpu_inference_server(conns, fast_adv_infer, fast_pol_infer):
     FIXED_BATCH = 16384  
     active_conns = list(conns)
     
-    MIN_BATCH_SIZE = 4096
-    MAX_WAIT_TIME = 0.05
+    MIN_BATCH_SIZE = 512
+    MAX_WAIT_TIME = 0.01 
 
     adv_buffer = np.zeros((FIXED_BATCH, 37, 55), dtype=np.float16)
     pol_buffer = np.zeros((FIXED_BATCH, 37, 55), dtype=np.float16)
@@ -95,12 +116,10 @@ def gpu_inference_server(conns, fast_adv_infer, fast_pol_infer):
         if adv_cursor >= MIN_BATCH_SIZE or (time_waiting > MAX_WAIT_TIME and adv_cursor > 0):
             tensor = tf.convert_to_tensor(adv_buffer, dtype=tf.float16)
             preds = fast_adv_infer(tensor).numpy()
-            
             idx = 0
             for c, length in zip(adv_pipes, adv_lens):
                 c.send(preds[idx : idx + length])
                 idx += length
-                
             adv_pipes, adv_lens = [], []
             adv_cursor = 0
             last_fire_time = time.time()
@@ -108,12 +127,10 @@ def gpu_inference_server(conns, fast_adv_infer, fast_pol_infer):
         if pol_cursor >= MIN_BATCH_SIZE or (time_waiting > MAX_WAIT_TIME and pol_cursor > 0):
             tensor = tf.convert_to_tensor(pol_buffer, dtype=tf.float16)
             preds = fast_pol_infer(tensor).numpy()
-            
             idx = 0
             for c, length in zip(pol_pipes, pol_lens):
                 c.send(preds[idx : idx + length])
                 idx += length
-                
             pol_pipes, pol_lens = [], []
             pol_cursor = 0
             last_fire_time = time.time()
@@ -261,7 +278,13 @@ def worker_generate_batch(num_games, conns, result_queue, current_episode, total
     for conn in conns:
         conn.send("DONE") 
 
-    result_queue.put((accumulated_train_x, accumulated_train_y, policy_x, policy_y, p1_wins, p2_wins, game_lengths))
+    result_queue.put((
+        np.array(accumulated_train_x, dtype=np.float16), 
+        np.array(accumulated_train_y, dtype=np.float32), 
+        np.array(policy_x, dtype=np.float16), 
+        np.array(policy_y, dtype=np.float32), 
+        p1_wins, p2_wins, game_lengths
+    ))
 
 # ==============================================================================
 # MAIN GPU LEARNER NODE
@@ -286,12 +309,34 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
         
     optimizer_adv = optimizers.Adam(learning_rate=1e-4)
     optimizer_pol = optimizers.Adam(learning_rate=1e-4)
-    
-    # BOTTLECK FIX 2: Enable jit_compile=True on fit() to stop the 40s stall!
+
     shared_adv_net.compile(optimizer=optimizer_adv, loss='mse', jit_compile=True)
     shared_pol_net.compile(optimizer=optimizer_pol, loss='mse', jit_compile=True) 
 
-    # BOTTLECK FIX 3: Define Global XLA Server Functions ONCE here!
+    @tf.function(input_signature=[
+        tf.TensorSpec(shape=(batch_size, 37, 55), dtype=tf.float16),
+        tf.TensorSpec(shape=(batch_size,), dtype=tf.float32)
+    ], jit_compile=True)
+    def train_adv_step(x_batch, y_batch):
+        with tf.GradientTape() as tape:
+            preds = shared_adv_net(x_batch, training=True)
+            loss = tf.reduce_mean(tf.square(y_batch - tf.squeeze(preds)))
+        grads = tape.gradient(loss, shared_adv_net.trainable_variables)
+        optimizer_adv.apply_gradients(zip(grads, shared_adv_net.trainable_variables))
+        return loss
+
+    @tf.function(input_signature=[
+        tf.TensorSpec(shape=(batch_size, 37, 55), dtype=tf.float16),
+        tf.TensorSpec(shape=(batch_size,), dtype=tf.float32)
+    ], jit_compile=True)
+    def train_pol_step(x_batch, y_batch):
+        with tf.GradientTape() as tape:
+            preds = shared_pol_net(x_batch, training=True)
+            loss = tf.reduce_mean(tf.square(y_batch - tf.squeeze(preds)))
+        grads = tape.gradient(loss, shared_pol_net.trainable_variables)
+        optimizer_pol.apply_gradients(zip(grads, shared_pol_net.trainable_variables))
+        return loss
+
     FIXED_BATCH = 16384
     @tf.function(input_signature=[tf.TensorSpec(shape=(FIXED_BATCH, 37, 55), dtype=tf.float16)], jit_compile=True)
     def fast_adv_infer(batch):
@@ -304,6 +349,8 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
     print("Compiling XLA Transformer Kernels (This takes a few seconds)...", flush=True)
     _ = fast_adv_infer(tf.zeros((FIXED_BATCH, 37, 55), dtype=tf.float16))
     _ = fast_pol_infer(tf.zeros((FIXED_BATCH, 37, 55), dtype=tf.float16))
+    _ = train_adv_step(tf.zeros((batch_size, 37, 55), dtype=tf.float16), tf.zeros((batch_size,), dtype=tf.float32))
+    _ = train_pol_step(tf.zeros((batch_size, 37, 55), dtype=tf.float16), tf.zeros((batch_size,), dtype=tf.float32))
     print("XLA Compilation Complete! Inference Engine Armed.", flush=True)
 
     metrics = {'p1_wins': 0, 'p2_wins': 0, 'game_lengths': [], 'adv_losses': [], 'pol_losses': []}
@@ -311,8 +358,14 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
     ctx = mp.get_context('spawn')
     
     MAX_BUFFER_SIZE = 200000
-    replay_buffer_x, replay_buffer_y = [], []
-    policy_buffer_x, policy_buffer_y = [], []
+    replay_adv_x = np.zeros((MAX_BUFFER_SIZE, 37, 55), dtype=np.float16)
+    replay_adv_y = np.zeros((MAX_BUFFER_SIZE,), dtype=np.float32)
+    replay_pol_x = np.zeros((MAX_BUFFER_SIZE, 37, 55), dtype=np.float16)
+    replay_pol_y = np.zeros((MAX_BUFFER_SIZE,), dtype=np.float32)
+    
+    # DECOUPLED TRACKERS: The Policy size grows much faster than Advantage size
+    replay_adv_size = 0
+    replay_pol_size = 0
     episodes_completed = 0
     total_games_generated = 0
 
@@ -320,14 +373,20 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
         print(f"Restoring historical replay buffers from '{buffer_path}'...", flush=True)
         with open(buffer_path, 'rb') as f:
             save_data = pickle.load(f)
-            replay_buffer_x = save_data['adv_x']
-            replay_buffer_y = save_data['adv_y']
-            policy_buffer_x = save_data['pol_x']
-            policy_buffer_y = save_data['pol_y']
+            
+            loaded_adv_x = save_data['adv_x']
+            replay_adv_size = len(loaded_adv_x)
+            replay_adv_x[:replay_adv_size] = loaded_adv_x
+            replay_adv_y[:replay_adv_size] = save_data['adv_y']
+            
+            loaded_pol_x = save_data['pol_x']
+            replay_pol_size = len(loaded_pol_x)
+            replay_pol_x[:replay_pol_size] = loaded_pol_x
+            replay_pol_y[:replay_pol_size] = save_data['pol_y']
+            
             episodes_completed = save_data['episodes_completed']
             total_games_generated = save_data['total_games_generated']
-        print(f"Successfully restored {len(replay_buffer_x)} games to memory.", flush=True)
-        print(f"Resuming training smoothly at Episode {episodes_completed}...", flush=True)
+        print(f"Successfully restored {replay_adv_size} adv states and {replay_pol_size} pol states.", flush=True)
     else:
         print("No historical buffer found. Starting fresh buffer generation.", flush=True)
 
@@ -335,14 +394,12 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
         decay_cycles = episodes_completed // 10000
         current_lr = max(1e-6, 1e-4 * (0.96 ** decay_cycles))
         
-        shared_adv_net.optimizer.learning_rate = current_lr
-        shared_pol_net.optimizer.learning_rate = current_lr
+        optimizer_adv.learning_rate.assign(current_lr)
+        optimizer_pol.learning_rate.assign(current_lr)
 
         base_games = episodes_per_update // num_workers
         remainder = episodes_per_update % num_workers
         worker_tasks = [base_games + (1 if i < remainder else 0) for i in range(num_workers)]
-
-        acc_new_adv_x, acc_new_adv_y, acc_new_pol_x, acc_new_pol_y = [], [], [], []
 
         pipes = [ctx.Pipe() for _ in range(total_threads)]
         parent_conns = [p[0] for p in pipes]
@@ -361,7 +418,6 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
                 p.start()
                 processes.append(p)
 
-        # Pass the pre-compiled global functions into the server
         gpu_inference_server(parent_conns, fast_adv_infer, fast_pol_infer)
         
         d_sim = time.time() - t_sim_start
@@ -372,63 +428,41 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
         
         for _ in range(len(processes)):
             adv_x, adv_y, pol_x, pol_y, p1w, p2w, gl = result_queue.get()
-            acc_new_adv_x.extend(adv_x)
-            acc_new_adv_y.extend(adv_y)
-            acc_new_pol_x.extend(pol_x)
-            acc_new_pol_y.extend(pol_y)
             metrics['p1_wins'] += p1w
             metrics['p2_wins'] += p2w
             metrics['game_lengths'].extend(gl)
+            total_games_generated += len(adv_x)
             
-            for i in range(len(adv_x)):
-                total_games_generated += 1
-                if len(replay_buffer_x) < MAX_BUFFER_SIZE:
-                    replay_buffer_x.append(adv_x[i])
-                    replay_buffer_y.append(adv_y[i])
-                    policy_buffer_x.append(pol_x[i])
-                    policy_buffer_y.append(pol_y[i])
-                else:
-                    replace_idx = random.randint(0, total_games_generated - 1)
-                    if replace_idx < MAX_BUFFER_SIZE:
-                        replay_buffer_x[replace_idx] = adv_x[i]
-                        replay_buffer_y[replace_idx] = adv_y[i]
-                        policy_buffer_x[replace_idx] = pol_x[i]
-                        policy_buffer_y[replace_idx] = pol_y[i]
+            # Independently track Advantage size and Policy size
+            replay_adv_size = add_to_buffer(replay_adv_x, replay_adv_y, adv_x, adv_y, replay_adv_size, MAX_BUFFER_SIZE)
+            replay_pol_size = add_to_buffer(replay_pol_x, replay_pol_y, pol_x, pol_y, replay_pol_size, MAX_BUFFER_SIZE)
 
         for p in processes: p.join()
         
         d_col = time.time() - t_col_start
         print(f"Done in {d_col:.2f}s", flush=True)
 
-        if replay_buffer_x and policy_buffer_x:
+        if replay_adv_size > 0 and replay_pol_size > 0:
             print("  [Phase 3] Training Data Prep...         ", end="", flush=True)
             t_prep_start = time.time()
             
             target_batch_size = 32000
             
-            train_adv_x_list, train_adv_y_list = list(acc_new_adv_x), list(acc_new_adv_y)
-            hist_needed_adv = min(target_batch_size - len(train_adv_x_list), len(replay_buffer_x))
-            if hist_needed_adv > 0:
-                indices = np.random.choice(len(replay_buffer_x), hist_needed_adv, replace=False)
-                for idx in indices:
-                    train_adv_x_list.append(replay_buffer_x[idx])
-                    train_adv_y_list.append(replay_buffer_y[idx])
+            # Independently prepare Adv training data
+            sample_adv_size = min(target_batch_size, replay_adv_size)
+            sample_adv_size = (sample_adv_size // batch_size) * batch_size
+            if sample_adv_size == 0: sample_adv_size = batch_size
+            idx_adv = np.random.choice(replay_adv_size, sample_adv_size, replace=False)
+            train_adv_x = replay_adv_x[idx_adv]
+            train_adv_y = replay_adv_y[idx_adv]
             
-            train_adv_x, train_adv_y = np.array(train_adv_x_list), np.array(train_adv_y_list)
-            shuff_adv = np.arange(len(train_adv_x))
-            np.random.shuffle(shuff_adv)
-            
-            train_pol_x_list, train_pol_y_list = list(acc_new_pol_x), list(acc_new_pol_y)
-            hist_needed_pol = min(target_batch_size - len(train_pol_x_list), len(policy_buffer_x))
-            if hist_needed_pol > 0:
-                indices = np.random.choice(len(policy_buffer_x), hist_needed_pol, replace=False)
-                for idx in indices:
-                    train_pol_x_list.append(policy_buffer_x[idx])
-                    train_pol_y_list.append(policy_buffer_y[idx])
-            
-            train_pol_x, train_pol_y = np.array(train_pol_x_list), np.array(train_pol_y_list)
-            shuff_pol = np.arange(len(train_pol_x))
-            np.random.shuffle(shuff_pol)
+            # Independently prepare Pol training data
+            sample_pol_size = min(target_batch_size, replay_pol_size)
+            sample_pol_size = (sample_pol_size // batch_size) * batch_size
+            if sample_pol_size == 0: sample_pol_size = batch_size
+            idx_pol = np.random.choice(replay_pol_size, sample_pol_size, replace=False)
+            train_pol_x = replay_pol_x[idx_pol]
+            train_pol_y = replay_pol_y[idx_pol]
             
             d_prep = time.time() - t_prep_start
             print(f"Done in {d_prep:.2f}s", flush=True)
@@ -436,16 +470,26 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
             print("  [Phase 4] Model Fitting (GPU Train)...  ", end="", flush=True)
             t_fit_start = time.time()
             
-            h1 = shared_adv_net.fit(train_adv_x[shuff_adv], train_adv_y[shuff_adv], epochs=1, verbose=0, batch_size=batch_size)
-            metrics['adv_losses'].append(h1.history['loss'][0])
-            
-            h2 = shared_pol_net.fit(train_pol_x[shuff_pol], train_pol_y[shuff_pol], epochs=1, verbose=0, batch_size=batch_size)
-            metrics['pol_losses'].append(h2.history['loss'][0])
+            adv_loss_sum = 0.0
+            adv_steps = sample_adv_size // batch_size
+            for i in range(0, sample_adv_size, batch_size):
+                end = i + batch_size
+                loss_a = train_adv_step(train_adv_x[i:end], train_adv_y[i:end])
+                adv_loss_sum += float(loss_a)
+                
+            pol_loss_sum = 0.0
+            pol_steps = sample_pol_size // batch_size
+            for i in range(0, sample_pol_size, batch_size):
+                end = i + batch_size
+                loss_p = train_pol_step(train_pol_x[i:end], train_pol_y[i:end])
+                pol_loss_sum += float(loss_p)
+                
+            metrics['adv_losses'].append(adv_loss_sum / max(1, adv_steps))
+            metrics['pol_losses'].append(pol_loss_sum / max(1, pol_steps))
             
             d_fit = time.time() - t_fit_start
             print(f"Done in {d_fit:.2f}s", flush=True)
             
-            # BOTTLECK FIX 1: Decoupled Memory Saving
             print("  [Phase 5] Disk Saving (I/O)...          ", end="", flush=True)
             t_save_start = time.time()
             
@@ -453,14 +497,13 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
             shared_pol_net.save(pol_path)
             episodes_completed += episodes_per_update
             
-            # Only dump the giant Pickle file every 5,000 episodes to prevent disk stalls!
             if episodes_completed % 5000 == 0:
                 with open(buffer_path, 'wb') as f:
                     pickle.dump({
-                        'adv_x': replay_buffer_x,
-                        'adv_y': replay_buffer_y,
-                        'pol_x': policy_buffer_x,
-                        'pol_y': policy_buffer_y,
+                        'adv_x': replay_adv_x[:replay_adv_size],
+                        'adv_y': replay_adv_y[:replay_adv_size],
+                        'pol_x': replay_pol_x[:replay_pol_size],
+                        'pol_y': replay_pol_y[:replay_pol_size],
                         'episodes_completed': episodes_completed,
                         'total_games_generated': total_games_generated
                     }, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -474,7 +517,6 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
         avg_pol = metrics['pol_losses'][-1] if metrics['pol_losses'] else 0.0
         avg_len = np.mean(metrics['game_lengths'][-episodes_per_update:])
         
-        # BOTTLECK FIX 4: Stop testing constantly, and pass the XLA graph to avoid compilation
         if episodes_completed % 5000 == 0:
             print("  [Phase 6] Model Evaluation...", flush=True)
             t_eval_start = time.time()
@@ -490,7 +532,7 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
         print(f"Episodes {episodes_completed}/{total_episodes} | Total Time: {elapsed:.1f}s | Current LR: {current_lr:.6f}", flush=True)
         print(f"  -> Win Rate: P1 ({metrics['p1_wins']}) vs P2 ({metrics['p2_wins']})", flush=True)
         print(f"  -> Avg Game Length: {avg_len:.1f} turns", flush=True)
-        print(f"  -> Buffer Size: {len(replay_buffer_x)} / {MAX_BUFFER_SIZE}", flush=True)
+        print(f"  -> Adv Buffer: {replay_adv_size} / {MAX_BUFFER_SIZE} | Pol Buffer: {replay_pol_size} / {MAX_BUFFER_SIZE}", flush=True)
         print(f"  -> Adv Loss: {avg_adv:.4f} | Pol Loss: {avg_pol:.4f}", flush=True)
         print("-" * 60, flush=True)
         metrics['p1_wins'], metrics['p2_wins'] = 0, 0
