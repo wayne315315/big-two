@@ -24,7 +24,6 @@ from test_tf_cfr import test_model
 def gpu_inference_server(conns, adv_net, pol_net):
     FIXED_BATCH = 16384  
     
-    # Updated TensorSpec to float16
     @tf.function(input_signature=[tf.TensorSpec(shape=(FIXED_BATCH, 37, 55), dtype=tf.float16)], jit_compile=True)
     def fast_adv_infer(batch):
         return adv_net(batch, training=False)
@@ -49,10 +48,10 @@ def gpu_inference_server(conns, adv_net, pol_net):
     pol_cursor = 0
     last_fire_time = time.time()
 
-    print("Compiling XLA Transformer Kernels (This takes a few seconds)...")
+    print("Compiling XLA Transformer Kernels (This takes a few seconds)...", flush=True)
     _ = fast_adv_infer(tf.convert_to_tensor(adv_buffer, dtype=tf.float16))
     _ = fast_pol_infer(tf.convert_to_tensor(pol_buffer, dtype=tf.float16))
-    print("XLA Compilation Complete! Inference Engine Armed.")
+    print("XLA Compilation Complete! Inference Engine Armed.", flush=True)
 
     while active_conns:
         ready_conns = []
@@ -282,20 +281,20 @@ def worker_generate_batch(num_games, conns, result_queue, current_episode, total
 # MAIN GPU LEARNER NODE
 # ==============================================================================
 def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advantage_model.keras', pol_path='tf_policy_model.keras', buffer_path='cfr_replay_buffers.pkl', num_workers=None, threads_per_worker=30, episodes_per_update=1000):
-    print("="*60)
-    print("INITIALIZING PIPED GPU-INFERENCE CFR (STATIC XLA PIPELINE)")
-    print("="*60)
+    print("="*60, flush=True)
+    print("INITIALIZING PIPED GPU-INFERENCE CFR (STATIC XLA PIPELINE)", flush=True)
+    print("="*60, flush=True)
     
     if num_workers is None: num_workers = max(1, mp.cpu_count() - 1)
     total_threads = num_workers * threads_per_worker
-    print(f"Server Architecture: 1 GPU Predictor | {num_workers} Processes x {threads_per_worker} Threads ({total_threads} virtual actors)")
+    print(f"Server Architecture: 1 GPU Predictor | {num_workers} Processes x {threads_per_worker} Threads ({total_threads} virtual actors)", flush=True)
 
     try:
         shared_adv_net = tf.keras.models.load_model(adv_path)
         shared_pol_net = tf.keras.models.load_model(pol_path)
-        print(f"Loaded existing FULL models from .keras files.")
+        print(f"Loaded existing FULL models from .keras files.", flush=True)
     except Exception as e:
-        print("Starting with fresh network weights and optimizers.")
+        print("Starting with fresh network weights and optimizers.", flush=True)
         shared_adv_net = create_advantage_network()
         shared_pol_net = create_policy_network()
         
@@ -316,7 +315,7 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
     total_games_generated = 0
 
     if os.path.exists(buffer_path):
-        print(f"Restoring historical replay buffers from '{buffer_path}'...")
+        print(f"Restoring historical replay buffers from '{buffer_path}'...", flush=True)
         with open(buffer_path, 'rb') as f:
             save_data = pickle.load(f)
             replay_buffer_x = save_data['adv_x']
@@ -325,10 +324,10 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
             policy_buffer_y = save_data['pol_y']
             episodes_completed = save_data['episodes_completed']
             total_games_generated = save_data['total_games_generated']
-        print(f"Successfully restored {len(replay_buffer_x)} games to memory.")
-        print(f"Resuming training smoothly at Episode {episodes_completed}...")
+        print(f"Successfully restored {len(replay_buffer_x)} games to memory.", flush=True)
+        print(f"Resuming training smoothly at Episode {episodes_completed}...", flush=True)
     else:
-        print("No historical buffer found. Starting fresh buffer generation.")
+        print("No historical buffer found. Starting fresh buffer generation.", flush=True)
 
     while episodes_completed < total_episodes:
         decay_cycles = episodes_completed // 10000
@@ -350,6 +349,10 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
         child_conn_chunks = [child_conns[i * threads_per_worker : (i + 1) * threads_per_worker] for i in range(num_workers)]
         result_queue = ctx.Queue()
 
+        # ==================== PROFILING TIMER 1: SIMULATION ====================
+        print("  [Phase 1] Simulation (CPU+GPU Infer)... ", end="", flush=True)
+        t_sim_start = time.time()
+        
         processes = []
         for i, task_count in enumerate(worker_tasks):
             if task_count > 0:
@@ -358,7 +361,15 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
                 processes.append(p)
 
         gpu_inference_server(parent_conns, shared_adv_net, shared_pol_net)
-
+        
+        d_sim = time.time() - t_sim_start
+        print(f"Done in {d_sim:.2f}s", flush=True)
+        # =======================================================================
+        
+        # ==================== PROFILING TIMER 2: DATA GATHERING ================
+        print("  [Phase 2] Buffer Collection...          ", end="", flush=True)
+        t_col_start = time.time()
+        
         for _ in range(len(processes)):
             adv_x, adv_y, pol_x, pol_y, p1w, p2w, gl = result_queue.get()
             acc_new_adv_x.extend(adv_x)
@@ -385,8 +396,16 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
                         policy_buffer_y[replace_idx] = pol_y[i]
 
         for p in processes: p.join()
+        
+        d_col = time.time() - t_col_start
+        print(f"Done in {d_col:.2f}s", flush=True)
+        # =======================================================================
 
         if replay_buffer_x and policy_buffer_x:
+            # ==================== PROFILING TIMER 3: DATA PREP =================
+            print("  [Phase 3] Training Data Prep...         ", end="", flush=True)
+            t_prep_start = time.time()
+            
             target_batch_size = 32000
             
             train_adv_x_list, train_adv_y_list = list(acc_new_adv_x), list(acc_new_adv_y)
@@ -401,9 +420,6 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
             shuff_adv = np.arange(len(train_adv_x))
             np.random.shuffle(shuff_adv)
             
-            h1 = shared_adv_net.fit(train_adv_x[shuff_adv], train_adv_y[shuff_adv], epochs=1, verbose=0, batch_size=batch_size)
-            metrics['adv_losses'].append(h1.history['loss'][0])
-            
             train_pol_x_list, train_pol_y_list = list(acc_new_pol_x), list(acc_new_pol_y)
             hist_needed_pol = min(target_batch_size - len(train_pol_x_list), len(policy_buffer_x))
             if hist_needed_pol > 0:
@@ -416,8 +432,27 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
             shuff_pol = np.arange(len(train_pol_x))
             np.random.shuffle(shuff_pol)
             
+            d_prep = time.time() - t_prep_start
+            print(f"Done in {d_prep:.2f}s", flush=True)
+            # =======================================================================
+            
+            # ==================== PROFILING TIMER 4: GPU TRAINING ==================
+            print("  [Phase 4] Model Fitting (GPU Train)...  ", end="", flush=True)
+            t_fit_start = time.time()
+            
+            h1 = shared_adv_net.fit(train_adv_x[shuff_adv], train_adv_y[shuff_adv], epochs=1, verbose=0, batch_size=batch_size)
+            metrics['adv_losses'].append(h1.history['loss'][0])
+            
             h2 = shared_pol_net.fit(train_pol_x[shuff_pol], train_pol_y[shuff_pol], epochs=1, verbose=0, batch_size=batch_size)
             metrics['pol_losses'].append(h2.history['loss'][0])
+            
+            d_fit = time.time() - t_fit_start
+            print(f"Done in {d_fit:.2f}s", flush=True)
+            # =======================================================================
+            
+            # ==================== PROFILING TIMER 5: DISK I/O ======================
+            print("  [Phase 5] Disk Saving (I/O)...          ", end="", flush=True)
+            t_save_start = time.time()
             
             shared_adv_net.save(adv_path)
             shared_pol_net.save(pol_path)
@@ -433,23 +468,35 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
                     'episodes_completed': episodes_completed,
                     'total_games_generated': total_games_generated
                 }, f, protocol=pickle.HIGHEST_PROTOCOL)
+                
+            d_save = time.time() - t_save_start
+            print(f"Done in {d_save:.2f}s", flush=True)
+            # =======================================================================
 
         avg_adv = metrics['adv_losses'][-1] if metrics['adv_losses'] else 0.0
         avg_pol = metrics['pol_losses'][-1] if metrics['pol_losses'] else 0.0
         avg_len = np.mean(metrics['game_lengths'][-episodes_per_update:])
         
+        # ==================== PROFILING TIMER 6: EVALUATION ====================
+        print("  [Phase 6] Model Evaluation...", flush=True)
+        t_eval_start = time.time()
         test_model(num_games=100, threads_per_worker=10)
+        d_eval = time.time() - t_eval_start
+        print(f"  -> Evaluation Finished in {d_eval:.2f}s", flush=True)
+        # =======================================================================
+        
         elapsed = time.time() - start_time
         
-        print(f"Episodes {episodes_completed}/{total_episodes} | Time: {elapsed:.1f}s | Current LR: {current_lr:.6f}")
-        print(f"  -> Win Rate: P1 ({metrics['p1_wins']}) vs P2 ({metrics['p2_wins']})")
-        print(f"  -> Avg Game Length: {avg_len:.1f} turns")
-        print(f"  -> Buffer Size: {len(replay_buffer_x)} / {MAX_BUFFER_SIZE}")
-        print(f"  -> Adv Loss: {avg_adv:.4f} | Pol Loss: {avg_pol:.4f}")
-        print("-" * 60)
+        print("\n" + "="*60, flush=True)
+        print(f"Episodes {episodes_completed}/{total_episodes} | Total Time: {elapsed:.1f}s | Current LR: {current_lr:.6f}", flush=True)
+        print(f"  -> Win Rate: P1 ({metrics['p1_wins']}) vs P2 ({metrics['p2_wins']})", flush=True)
+        print(f"  -> Avg Game Length: {avg_len:.1f} turns", flush=True)
+        print(f"  -> Buffer Size: {len(replay_buffer_x)} / {MAX_BUFFER_SIZE}", flush=True)
+        print(f"  -> Adv Loss: {avg_adv:.4f} | Pol Loss: {avg_pol:.4f}", flush=True)
+        print("-" * 60, flush=True)
         metrics['p1_wins'], metrics['p2_wins'] = 0, 0
 
-    print(f"\nTraining Complete! Final models secured.")
+    print(f"\nTraining Complete! Final models secured.", flush=True)
 
 if __name__ == "__main__":
     mp.freeze_support()
