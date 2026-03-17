@@ -21,23 +21,14 @@ from test_tf_cfr import test_model
 # ==============================================================================
 # THE GPU INFERENCE SERVER (STATIC XLA BUFFERING)
 # ==============================================================================
-def gpu_inference_server(conns, adv_net, pol_net):
+# BOTTLECK FIX 3: Moved tf.function definitions OUTSIDE the server so they don't recompile
+def gpu_inference_server(conns, fast_adv_infer, fast_pol_infer):
     FIXED_BATCH = 16384  
-    
-    @tf.function(input_signature=[tf.TensorSpec(shape=(FIXED_BATCH, 37, 55), dtype=tf.float16)], jit_compile=True)
-    def fast_adv_infer(batch):
-        return adv_net(batch, training=False)
-
-    @tf.function(input_signature=[tf.TensorSpec(shape=(FIXED_BATCH, 37, 55), dtype=tf.float16)], jit_compile=True)
-    def fast_pol_infer(batch):
-        return pol_net(batch, training=False)
-
     active_conns = list(conns)
     
     MIN_BATCH_SIZE = 4096
     MAX_WAIT_TIME = 0.05
 
-    # Native float16 RAM buffers
     adv_buffer = np.zeros((FIXED_BATCH, 37, 55), dtype=np.float16)
     pol_buffer = np.zeros((FIXED_BATCH, 37, 55), dtype=np.float16)
     
@@ -47,11 +38,6 @@ def gpu_inference_server(conns, adv_net, pol_net):
     adv_cursor = 0
     pol_cursor = 0
     last_fire_time = time.time()
-
-    print("Compiling XLA Transformer Kernels (This takes a few seconds)...", flush=True)
-    _ = fast_adv_infer(tf.convert_to_tensor(adv_buffer, dtype=tf.float16))
-    _ = fast_pol_infer(tf.convert_to_tensor(pol_buffer, dtype=tf.float16))
-    print("XLA Compilation Complete! Inference Engine Armed.", flush=True)
 
     while active_conns:
         ready_conns = []
@@ -298,11 +284,27 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
         shared_adv_net = create_advantage_network()
         shared_pol_net = create_policy_network()
         
-        optimizer_adv = optimizers.Adam(learning_rate=1e-4)
-        optimizer_pol = optimizers.Adam(learning_rate=1e-4)
-        
-        shared_adv_net.compile(optimizer=optimizer_adv, loss='mse')
-        shared_pol_net.compile(optimizer=optimizer_pol, loss='mse') 
+    optimizer_adv = optimizers.Adam(learning_rate=1e-4)
+    optimizer_pol = optimizers.Adam(learning_rate=1e-4)
+    
+    # BOTTLECK FIX 2: Enable jit_compile=True on fit() to stop the 40s stall!
+    shared_adv_net.compile(optimizer=optimizer_adv, loss='mse', jit_compile=True)
+    shared_pol_net.compile(optimizer=optimizer_pol, loss='mse', jit_compile=True) 
+
+    # BOTTLECK FIX 3: Define Global XLA Server Functions ONCE here!
+    FIXED_BATCH = 16384
+    @tf.function(input_signature=[tf.TensorSpec(shape=(FIXED_BATCH, 37, 55), dtype=tf.float16)], jit_compile=True)
+    def fast_adv_infer(batch):
+        return shared_adv_net(batch, training=False)
+
+    @tf.function(input_signature=[tf.TensorSpec(shape=(FIXED_BATCH, 37, 55), dtype=tf.float16)], jit_compile=True)
+    def fast_pol_infer(batch):
+        return shared_pol_net(batch, training=False)
+
+    print("Compiling XLA Transformer Kernels (This takes a few seconds)...", flush=True)
+    _ = fast_adv_infer(tf.zeros((FIXED_BATCH, 37, 55), dtype=tf.float16))
+    _ = fast_pol_infer(tf.zeros((FIXED_BATCH, 37, 55), dtype=tf.float16))
+    print("XLA Compilation Complete! Inference Engine Armed.", flush=True)
 
     metrics = {'p1_wins': 0, 'p2_wins': 0, 'game_lengths': [], 'adv_losses': [], 'pol_losses': []}
     start_time = time.time()
@@ -349,7 +351,6 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
         child_conn_chunks = [child_conns[i * threads_per_worker : (i + 1) * threads_per_worker] for i in range(num_workers)]
         result_queue = ctx.Queue()
 
-        # ==================== PROFILING TIMER 1: SIMULATION ====================
         print("  [Phase 1] Simulation (CPU+GPU Infer)... ", end="", flush=True)
         t_sim_start = time.time()
         
@@ -360,13 +361,12 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
                 p.start()
                 processes.append(p)
 
-        gpu_inference_server(parent_conns, shared_adv_net, shared_pol_net)
+        # Pass the pre-compiled global functions into the server
+        gpu_inference_server(parent_conns, fast_adv_infer, fast_pol_infer)
         
         d_sim = time.time() - t_sim_start
         print(f"Done in {d_sim:.2f}s", flush=True)
-        # =======================================================================
         
-        # ==================== PROFILING TIMER 2: DATA GATHERING ================
         print("  [Phase 2] Buffer Collection...          ", end="", flush=True)
         t_col_start = time.time()
         
@@ -399,10 +399,8 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
         
         d_col = time.time() - t_col_start
         print(f"Done in {d_col:.2f}s", flush=True)
-        # =======================================================================
 
         if replay_buffer_x and policy_buffer_x:
-            # ==================== PROFILING TIMER 3: DATA PREP =================
             print("  [Phase 3] Training Data Prep...         ", end="", flush=True)
             t_prep_start = time.time()
             
@@ -434,9 +432,7 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
             
             d_prep = time.time() - t_prep_start
             print(f"Done in {d_prep:.2f}s", flush=True)
-            # =======================================================================
             
-            # ==================== PROFILING TIMER 4: GPU TRAINING ==================
             print("  [Phase 4] Model Fitting (GPU Train)...  ", end="", flush=True)
             t_fit_start = time.time()
             
@@ -448,43 +444,46 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
             
             d_fit = time.time() - t_fit_start
             print(f"Done in {d_fit:.2f}s", flush=True)
-            # =======================================================================
             
-            # ==================== PROFILING TIMER 5: DISK I/O ======================
+            # BOTTLECK FIX 1: Decoupled Memory Saving
             print("  [Phase 5] Disk Saving (I/O)...          ", end="", flush=True)
             t_save_start = time.time()
             
             shared_adv_net.save(adv_path)
             shared_pol_net.save(pol_path)
-
             episodes_completed += episodes_per_update
             
-            with open(buffer_path, 'wb') as f:
-                pickle.dump({
-                    'adv_x': replay_buffer_x,
-                    'adv_y': replay_buffer_y,
-                    'pol_x': policy_buffer_x,
-                    'pol_y': policy_buffer_y,
-                    'episodes_completed': episodes_completed,
-                    'total_games_generated': total_games_generated
-                }, f, protocol=pickle.HIGHEST_PROTOCOL)
-                
-            d_save = time.time() - t_save_start
-            print(f"Done in {d_save:.2f}s", flush=True)
-            # =======================================================================
+            # Only dump the giant Pickle file every 5,000 episodes to prevent disk stalls!
+            if episodes_completed % 5000 == 0:
+                with open(buffer_path, 'wb') as f:
+                    pickle.dump({
+                        'adv_x': replay_buffer_x,
+                        'adv_y': replay_buffer_y,
+                        'pol_x': policy_buffer_x,
+                        'pol_y': policy_buffer_y,
+                        'episodes_completed': episodes_completed,
+                        'total_games_generated': total_games_generated
+                    }, f, protocol=pickle.HIGHEST_PROTOCOL)
+                d_save = time.time() - t_save_start
+                print(f"Done in {d_save:.2f}s (Models + Memory Buffer Sync)", flush=True)
+            else:
+                d_save = time.time() - t_save_start
+                print(f"Done in {d_save:.2f}s (Models Only)", flush=True)
 
         avg_adv = metrics['adv_losses'][-1] if metrics['adv_losses'] else 0.0
         avg_pol = metrics['pol_losses'][-1] if metrics['pol_losses'] else 0.0
         avg_len = np.mean(metrics['game_lengths'][-episodes_per_update:])
         
-        # ==================== PROFILING TIMER 6: EVALUATION ====================
-        print("  [Phase 6] Model Evaluation...", flush=True)
-        t_eval_start = time.time()
-        test_model(num_games=100, threads_per_worker=10)
-        d_eval = time.time() - t_eval_start
-        print(f"  -> Evaluation Finished in {d_eval:.2f}s", flush=True)
-        # =======================================================================
-        
+        # BOTTLECK FIX 4: Stop testing constantly, and pass the XLA graph to avoid compilation
+        if episodes_completed % 5000 == 0:
+            print("  [Phase 6] Model Evaluation...", flush=True)
+            t_eval_start = time.time()
+            test_model(num_games=100, threads_per_worker=10, fast_pol_infer=fast_pol_infer)
+            d_eval = time.time() - t_eval_start
+            print(f"  -> Evaluation Finished in {d_eval:.2f}s", flush=True)
+        else:
+            print("  [Phase 6] Model Evaluation...           Skipped this round.", flush=True)
+            
         elapsed = time.time() - start_time
         
         print("\n" + "="*60, flush=True)

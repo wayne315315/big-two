@@ -18,12 +18,19 @@ from tf_deep_cfr_bot import TFDeepCFRBot, create_policy_network
 # ==============================================================================
 # THE GPU INFERENCE SERVER (STATIC XLA BUFFERING)
 # ==============================================================================
-def gpu_inference_server(conns, pol_net):
+# BOTTLECK FIX: Test server now accepts the pre-compiled graph to save 10+ seconds
+def gpu_inference_server(conns, pol_net=None, fast_pol_infer=None):
     FIXED_BATCH = 16384
     
-    @tf.function(input_signature=[tf.TensorSpec(shape=(FIXED_BATCH, 37, 55), dtype=tf.float16)], jit_compile=True)
-    def fast_pol_infer(batch):
-        return pol_net(batch, training=False)
+    if fast_pol_infer is None:
+        @tf.function(input_signature=[tf.TensorSpec(shape=(FIXED_BATCH, 37, 55), dtype=tf.float16)], jit_compile=True)
+        def fast_pol_infer_internal(batch):
+            return pol_net(batch, training=False)
+        fast_pol_infer = fast_pol_infer_internal
+
+        print("Compiling XLA Transformer Kernel (This takes a few seconds)...")
+        _ = fast_pol_infer(tf.zeros((FIXED_BATCH, 37, 55), dtype=tf.float16))
+        print("XLA Compilation Complete! Benchmark Engine Armed.")
 
     active_conns = list(conns)
     
@@ -34,10 +41,6 @@ def gpu_inference_server(conns, pol_net):
     pol_pipes, pol_lens = [], []
     pol_cursor = 0
     last_fire_time = time.time()
-
-    print("Compiling XLA Transformer Kernel (This takes a few seconds)...")
-    _ = fast_pol_infer(tf.convert_to_tensor(pol_buffer, dtype=tf.float16))
-    print("XLA Compilation Complete! Benchmark Engine Armed.")
 
     while active_conns:
         ready_conns = []
@@ -195,7 +198,8 @@ def distributed_test_worker(num_games, conns, result_queue):
 # ==============================================================================
 # MAIN TEST ORCHESTRATOR
 # ==============================================================================
-def test_model(num_games=1000, policy_path="tf_policy_model.keras", num_workers=None, threads_per_worker=10):
+# Modified signature to accept pre-compiled functions
+def test_model(num_games=1000, policy_path="tf_policy_model.keras", num_workers=None, threads_per_worker=10, fast_pol_infer=None):
     print("="*60)
     print(f"DISTRIBUTED FLOAT16 GPU BENCHMARK ({num_games} GAMES)")
     print("="*60)
@@ -203,16 +207,26 @@ def test_model(num_games=1000, policy_path="tf_policy_model.keras", num_workers=
     if num_workers is None:
         num_workers = max(1, mp.cpu_count() - 1)
         
+    # Prevent over-spawning if num_games is very small
+    if num_games < num_workers * threads_per_worker:
+        num_workers = max(1, num_games // threads_per_worker)
+        if num_workers == 0:
+            num_workers = 1
+            threads_per_worker = num_games
+        
     total_threads = num_workers * threads_per_worker
     print(f"Spawning {num_workers} processes x {threads_per_worker} threads ({total_threads} virtual actors) utilizing 1 GPU...")
     start_time = time.time()
     
-    try:
-        shared_pol_net = tf.keras.models.load_model(policy_path, compile=False)
-        print(f"Successfully loaded full model '{policy_path}'")
-    except:
-        print(f"Warning: Could not load '{policy_path}'. Using random weights.")
-        shared_pol_net = create_policy_network()
+    if fast_pol_infer is None:
+        try:
+            shared_pol_net = tf.keras.models.load_model(policy_path, compile=False)
+            print(f"Successfully loaded full model '{policy_path}'")
+        except:
+            print(f"Warning: Could not load '{policy_path}'. Using random weights.")
+            shared_pol_net = create_policy_network()
+    else:
+        shared_pol_net = None # Skip loading model if function is already compiled
         
     ctx = mp.get_context('spawn')
     
@@ -235,7 +249,7 @@ def test_model(num_games=1000, policy_path="tf_policy_model.keras", num_workers=
             p.start()
             processes.append(p)
 
-    gpu_inference_server(parent_conns, shared_pol_net)
+    gpu_inference_server(parent_conns, shared_pol_net, fast_pol_infer)
 
     total_cfr_wins, total_std_wins = 0, 0
     for _ in range(len(processes)):
