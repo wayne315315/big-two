@@ -13,6 +13,8 @@ def play_game():
     piles = [deck[i * 13 : (i + 1) * 13] for i in range(4)]
     
     player1 = HumanPlayer("Player 1")
+    
+    # To play against the AI, swap this to TFDeepCFRBot("AI Bot", is_training=False)
     player2 = BotPlayer("Big Two Bot") 
     
     # Assign to 2 players and discard the remaining 2 piles
@@ -40,7 +42,8 @@ def play_game():
         'table_cards': [],
         'is_first_turn': True,
         'lowest_card': lowest_card,
-        'dead_cards': []  # <--- CORRECTED: Starts strictly empty!
+        'dead_cards': [],  
+        'history': []     # <--- ADDED: Required for Transformer Memory
     }
     
     last_player_idx = None
@@ -49,6 +52,12 @@ def play_game():
     while True:
         print("\n" + "="*40)
         current_player = players[current_idx]
+        
+        # --- NEW: INJECT AI METRICS ---
+        game_state['my_idx'] = current_idx
+        game_state['my_hand_size'] = len(current_player.hand)
+        game_state['opp_hand_size'] = len(players[1 - current_idx].hand)
+        # ------------------------------
         
         # If the turn comes back to the last person who played, they win the trick and clear the table
         if last_player_idx == current_idx:
@@ -75,6 +84,7 @@ def play_game():
                     print("Invalid play: You cannot pass! You control the table. You must play something.")
                     continue
                 print(f"{current_player.name} passes.")
+                game_state['history'].append((current_idx, [])) # <--- ADDED: Log Pass for Transformer
                 break
                 
             # Handle First Turn Constraint
@@ -95,6 +105,8 @@ def play_game():
             # Play is valid! Apply to game state.
             print(f"{current_player.name} plays: {', '.join([f'{c[0]}-{c[1][0]}' for c in selected_cards])}")
             current_player.remove_cards(selected_cards)
+            
+            game_state['history'].append((current_idx, selected_cards)) # <--- ADDED: Log Play for Transformer
             
             # Move the previously beaten cards to the dead pile before overwriting
             game_state['dead_cards'].extend(game_state['table_cards'])

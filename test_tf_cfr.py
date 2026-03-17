@@ -6,6 +6,10 @@ import multiprocessing.connection
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import tensorflow as tf
+from tensorflow.keras import mixed_precision
+
+# Enable Mixed Precision
+mixed_precision.set_global_policy('mixed_float16')
 
 from helper import RANKS, SUITS, get_card_value, evaluate_play
 from player import BotPlayer
@@ -17,7 +21,7 @@ from tf_deep_cfr_bot import TFDeepCFRBot, create_policy_network
 def gpu_inference_server(conns, pol_net):
     FIXED_BATCH = 16384
     
-    @tf.function(input_signature=[tf.TensorSpec(shape=(FIXED_BATCH, 37, 55), dtype=tf.float32)], jit_compile=True)
+    @tf.function(input_signature=[tf.TensorSpec(shape=(FIXED_BATCH, 37, 55), dtype=tf.float16)], jit_compile=True)
     def fast_pol_infer(batch):
         return pol_net(batch, training=False)
 
@@ -26,13 +30,13 @@ def gpu_inference_server(conns, pol_net):
     MIN_BATCH_SIZE = 4096
     MAX_WAIT_TIME = 0.05
 
-    pol_buffer = np.zeros((FIXED_BATCH, 37, 55), dtype=np.float32)
+    pol_buffer = np.zeros((FIXED_BATCH, 37, 55), dtype=np.float16)
     pol_pipes, pol_lens = [], []
     pol_cursor = 0
     last_fire_time = time.time()
 
     print("Compiling XLA Transformer Kernel (This takes a few seconds)...")
-    _ = fast_pol_infer(tf.convert_to_tensor(pol_buffer))
+    _ = fast_pol_infer(tf.convert_to_tensor(pol_buffer, dtype=tf.float16))
     print("XLA Compilation Complete! Benchmark Engine Armed.")
 
     while active_conns:
@@ -51,7 +55,7 @@ def gpu_inference_server(conns, pol_net):
                     if is_policy:  
                         length = len(inputs)
                         if pol_cursor + length > FIXED_BATCH:
-                            tensor = tf.convert_to_tensor(pol_buffer)
+                            tensor = tf.convert_to_tensor(pol_buffer, dtype=tf.float16)
                             preds = fast_pol_infer(tensor).numpy()
                             idx = 0
                             for c, l in zip(pol_pipes, pol_lens):
@@ -72,7 +76,7 @@ def gpu_inference_server(conns, pol_net):
         time_waiting = time.time() - last_fire_time
         
         if pol_cursor >= MIN_BATCH_SIZE or (time_waiting > MAX_WAIT_TIME and pol_cursor > 0):
-            tensor = tf.convert_to_tensor(pol_buffer)
+            tensor = tf.convert_to_tensor(pol_buffer, dtype=tf.float16)
             preds = fast_pol_infer(tensor).numpy()
             
             idx = 0
@@ -193,7 +197,7 @@ def distributed_test_worker(num_games, conns, result_queue):
 # ==============================================================================
 def test_model(num_games=1000, policy_path="tf_policy_model.keras", num_workers=None, threads_per_worker=10):
     print("="*60)
-    print(f"DISTRIBUTED FLOAT32 GPU BENCHMARK ({num_games} GAMES)")
+    print(f"DISTRIBUTED FLOAT16 GPU BENCHMARK ({num_games} GAMES)")
     print("="*60)
     
     if num_workers is None:

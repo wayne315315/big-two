@@ -2,10 +2,16 @@ import random
 import itertools
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras import layers, models
+from tensorflow.keras import layers, models, mixed_precision
 
+# Restored missing imports!
 from helper import RANKS, SUITS, evaluate_play, is_valid_beat
 from player import Player
+
+# ==============================================================================
+# ENABLE MIXED PRECISION (TENSOR CORES)
+# ==============================================================================
+mixed_precision.set_global_policy('mixed_float16')
 
 # ==============================================================================
 # TRANSFORMER ARCHITECTURE
@@ -37,10 +43,12 @@ def create_transformer_network(input_shape=(37, 55), head_size=64, num_heads=4, 
     x = layers.Dense(128, activation='relu')(x)
     x = layers.BatchNormalization()(x)
     
+    # MIXED PRECISION: Final output must be explicitly float32 for numerical stability
+    x = layers.Dense(1)(x)
     if is_policy:
-        outputs = layers.Dense(1, activation='sigmoid')(x)
+        outputs = layers.Activation('sigmoid', dtype='float32')(x)
     else:
-        outputs = layers.Dense(1, activation='linear')(x) 
+        outputs = layers.Activation('linear', dtype='float32')(x) 
 
     return models.Model(inputs=inputs, outputs=outputs)
 
@@ -94,21 +102,15 @@ class TFDeepCFRBot(Player):
         my_s_norm = current_my_size / 13.0
         opp_s_norm = current_opp_size / 13.0
 
-        # Row 0: Current Hand
         for c in self.hand: seq[0, self._card_to_index(c)] = 1.0
         seq[0, 52], seq[0, 53], seq[0, 54] = 1.0, my_s_norm, opp_s_norm
         
-        # Row 1: Current Table
         for c in game_state.get('table_cards', []): seq[1, self._card_to_index(c)] = 1.0
         seq[1, 52], seq[1, 53], seq[1, 54] = 0.0, my_s_norm, opp_s_norm
         
-        # Row 2 (Action) is skipped here!
-        
-        # Row 3: Explicit Dead Cards Mask
         for c in game_state.get('dead_cards', []): seq[3, self._card_to_index(c)] = 1.0
         seq[3, 52], seq[3, 53], seq[3, 54] = 0.0, my_s_norm, opp_s_norm
         
-        # Rows 4+: Historical Turn Sequence
         history = game_state.get('history', [])
         hist_len = min(len(history), MAX_SEQ_LEN - 4)
         

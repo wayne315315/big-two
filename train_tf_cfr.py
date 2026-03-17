@@ -8,7 +8,10 @@ import multiprocessing.connection
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import tensorflow as tf
-from tensorflow.keras import optimizers
+from tensorflow.keras import optimizers, mixed_precision
+
+# Enable Mixed Precision
+mixed_precision.set_global_policy('mixed_float16')
 
 from helper import RANKS, SUITS, get_card_value, evaluate_play
 from player import BotPlayer
@@ -19,13 +22,14 @@ from test_tf_cfr import test_model
 # THE GPU INFERENCE SERVER (STATIC XLA BUFFERING)
 # ==============================================================================
 def gpu_inference_server(conns, adv_net, pol_net):
-    FIXED_BATCH = 16384  # Lock the matrix shape so the GPU NEVER recompiles
+    FIXED_BATCH = 16384  
     
-    @tf.function(input_signature=[tf.TensorSpec(shape=(FIXED_BATCH, 37, 55), dtype=tf.float32)], jit_compile=True)
+    # Updated TensorSpec to float16
+    @tf.function(input_signature=[tf.TensorSpec(shape=(FIXED_BATCH, 37, 55), dtype=tf.float16)], jit_compile=True)
     def fast_adv_infer(batch):
         return adv_net(batch, training=False)
 
-    @tf.function(input_signature=[tf.TensorSpec(shape=(FIXED_BATCH, 37, 55), dtype=tf.float32)], jit_compile=True)
+    @tf.function(input_signature=[tf.TensorSpec(shape=(FIXED_BATCH, 37, 55), dtype=tf.float16)], jit_compile=True)
     def fast_pol_infer(batch):
         return pol_net(batch, training=False)
 
@@ -34,9 +38,9 @@ def gpu_inference_server(conns, adv_net, pol_net):
     MIN_BATCH_SIZE = 4096
     MAX_WAIT_TIME = 0.05
 
-    # PRE-ALLOCATED RAM BUFFERS: Eliminates np.concatenate() overhead entirely
-    adv_buffer = np.zeros((FIXED_BATCH, 37, 55), dtype=np.float32)
-    pol_buffer = np.zeros((FIXED_BATCH, 37, 55), dtype=np.float32)
+    # Native float16 RAM buffers
+    adv_buffer = np.zeros((FIXED_BATCH, 37, 55), dtype=np.float16)
+    pol_buffer = np.zeros((FIXED_BATCH, 37, 55), dtype=np.float16)
     
     adv_pipes, adv_lens = [], []
     pol_pipes, pol_lens = [], []
@@ -45,10 +49,9 @@ def gpu_inference_server(conns, adv_net, pol_net):
     pol_cursor = 0
     last_fire_time = time.time()
 
-    # WARMUP THE GPU: Compile the XLA graphs instantly before the loop starts
     print("Compiling XLA Transformer Kernels (This takes a few seconds)...")
-    _ = fast_adv_infer(tf.convert_to_tensor(adv_buffer))
-    _ = fast_pol_infer(tf.convert_to_tensor(pol_buffer))
+    _ = fast_adv_infer(tf.convert_to_tensor(adv_buffer, dtype=tf.float16))
+    _ = fast_pol_infer(tf.convert_to_tensor(pol_buffer, dtype=tf.float16))
     print("XLA Compilation Complete! Inference Engine Armed.")
 
     while active_conns:
@@ -68,7 +71,7 @@ def gpu_inference_server(conns, adv_net, pol_net):
                     
                     if is_policy:
                         if pol_cursor + length > FIXED_BATCH:
-                            tensor = tf.convert_to_tensor(pol_buffer)
+                            tensor = tf.convert_to_tensor(pol_buffer, dtype=tf.float16)
                             preds = fast_pol_infer(tensor).numpy()
                             idx = 0
                             for c, l in zip(pol_pipes, pol_lens):
@@ -78,14 +81,13 @@ def gpu_inference_server(conns, adv_net, pol_net):
                             pol_cursor = 0
                             last_fire_time = time.time()
                             
-                        # Inputs are float16. Numpy handles casting them implicitly into our float32 buffer
                         pol_buffer[pol_cursor : pol_cursor + length] = inputs
                         pol_pipes.append(conn)
                         pol_lens.append(length)
                         pol_cursor += length
                     else:
                         if adv_cursor + length > FIXED_BATCH:
-                            tensor = tf.convert_to_tensor(adv_buffer)
+                            tensor = tf.convert_to_tensor(adv_buffer, dtype=tf.float16)
                             preds = fast_adv_infer(tensor).numpy()
                             idx = 0
                             for c, l in zip(adv_pipes, adv_lens):
@@ -106,7 +108,7 @@ def gpu_inference_server(conns, adv_net, pol_net):
         time_waiting = time.time() - last_fire_time
 
         if adv_cursor >= MIN_BATCH_SIZE or (time_waiting > MAX_WAIT_TIME and adv_cursor > 0):
-            tensor = tf.convert_to_tensor(adv_buffer)
+            tensor = tf.convert_to_tensor(adv_buffer, dtype=tf.float16)
             preds = fast_adv_infer(tensor).numpy()
             
             idx = 0
@@ -119,7 +121,7 @@ def gpu_inference_server(conns, adv_net, pol_net):
             last_fire_time = time.time()
                 
         if pol_cursor >= MIN_BATCH_SIZE or (time_waiting > MAX_WAIT_TIME and pol_cursor > 0):
-            tensor = tf.convert_to_tensor(pol_buffer)
+            tensor = tf.convert_to_tensor(pol_buffer, dtype=tf.float16)
             preds = fast_pol_infer(tensor).numpy()
             
             idx = 0
@@ -279,7 +281,7 @@ def worker_generate_batch(num_games, conns, result_queue, current_episode, total
 # ==============================================================================
 # MAIN GPU LEARNER NODE
 # ==============================================================================
-def train_self_play(total_episodes=2000000, batch_size=8192, adv_path='tf_advantage_model.keras', pol_path='tf_policy_model.keras', buffer_path='cfr_replay_buffers.pkl', num_workers=None, threads_per_worker=30, episodes_per_update=250):
+def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advantage_model.keras', pol_path='tf_policy_model.keras', buffer_path='cfr_replay_buffers.pkl', num_workers=None, threads_per_worker=30, episodes_per_update=1000):
     print("="*60)
     print("INITIALIZING PIPED GPU-INFERENCE CFR (STATIC XLA PIPELINE)")
     print("="*60)
@@ -399,7 +401,6 @@ def train_self_play(total_episodes=2000000, batch_size=8192, adv_path='tf_advant
             shuff_adv = np.arange(len(train_adv_x))
             np.random.shuffle(shuff_adv)
             
-            # INCREASED EPOCHS: Doing more heavy lifting per cycle (GPU Utilization spike!)
             h1 = shared_adv_net.fit(train_adv_x[shuff_adv], train_adv_y[shuff_adv], epochs=1, verbose=0, batch_size=batch_size)
             metrics['adv_losses'].append(h1.history['loss'][0])
             
@@ -415,7 +416,7 @@ def train_self_play(total_episodes=2000000, batch_size=8192, adv_path='tf_advant
             shuff_pol = np.arange(len(train_pol_x))
             np.random.shuffle(shuff_pol)
             
-            h2 = shared_pol_net.fit(train_pol_x[shuff_pol], train_pol_y[shuff_pol], epochs=3, verbose=0, batch_size=batch_size)
+            h2 = shared_pol_net.fit(train_pol_x[shuff_pol], train_pol_y[shuff_pol], epochs=1, verbose=0, batch_size=batch_size)
             metrics['pol_losses'].append(h2.history['loss'][0])
             
             shared_adv_net.save(adv_path)
@@ -452,6 +453,4 @@ def train_self_play(total_episodes=2000000, batch_size=8192, adv_path='tf_advant
 
 if __name__ == "__main__":
     mp.freeze_support()
-    # FREQUENT UPDATES: Train every 250 episodes instead of 1000
-    # BATCH SIZE: 8192 (Lower this to 4096 if your RTX 2060 runs out of VRAM!)
     train_self_play(total_episodes=2000000, episodes_per_update=1000, batch_size=4096, threads_per_worker=30)
