@@ -8,67 +8,50 @@ from helper import RANKS, SUITS, evaluate_play, is_valid_beat
 from player import Player
 
 # ==============================================================================
-# NEURAL NETWORK ARCHITECTURES
+# TRANSFORMER ARCHITECTURE
 # ==============================================================================
-def create_advantage_network(input_size=208, hidden_size=512, num_res_blocks=3):
-    """
-    THE TEACHER: Predicts the Raw Expected Value (Q-Value) of taking an action.
-    Uses a Deep Residual Network (ResNet) to prevent catastrophic forgetting.
-    """
-    inputs = layers.Input(shape=(input_size,))
-    x = layers.Dense(hidden_size)(inputs)
-    x = layers.BatchNormalization()(x)
-    x = layers.Activation('relu')(x)
+def transformer_encoder(inputs, head_size, num_heads, ff_dim, dropout=0.1):
+    x = layers.LayerNormalization(epsilon=1e-6)(inputs)
+    x = layers.MultiHeadAttention(key_dim=head_size, num_heads=num_heads, dropout=dropout)(x, x)
+    x = layers.Dropout(dropout)(x)
+    res = x + inputs
 
-    # Skip connections (Residual Blocks) allow gradients to flow deep into the network
-    for _ in range(num_res_blocks):
-        residual = x
-        x = layers.Dense(hidden_size)(x)
-        x = layers.BatchNormalization()(x)
-        x = layers.Activation('relu')(x)
-        x = layers.Dense(hidden_size)(x)
-        x = layers.BatchNormalization()(x)
-        x = layers.Add()([x, residual])  # Add original input back (Skip connection)
-        x = layers.Activation('relu')(x)
+    x = layers.LayerNormalization(epsilon=1e-6)(res)
+    x = layers.Dense(ff_dim, activation="relu")(x)
+    x = layers.Dropout(dropout)(x)
+    x = layers.Dense(inputs.shape[-1])(x)
+    return x + res
 
+def create_transformer_network(input_shape=(37, 55), head_size=64, num_heads=4, ff_dim=256, num_blocks=3, is_policy=False):
+    inputs = layers.Input(shape=input_shape)
+    
+    positions = tf.range(start=0, limit=input_shape[0], delta=1)
+    position_embedding = layers.Embedding(input_dim=input_shape[0], output_dim=input_shape[1])(positions)
+    
+    x = inputs + position_embedding
+    
+    for _ in range(num_blocks):
+        x = transformer_encoder(x, head_size, num_heads, ff_dim)
+        
+    x = layers.GlobalAveragePooling1D()(x)
     x = layers.Dense(128, activation='relu')(x)
     x = layers.BatchNormalization()(x)
     
-    x = layers.Dense(1)(x) 
-    outputs = layers.Activation('linear')(x) # Linear for Q-Values
+    if is_policy:
+        outputs = layers.Dense(1, activation='sigmoid')(x)
+    else:
+        outputs = layers.Dense(1, activation='linear')(x) 
 
     return models.Model(inputs=inputs, outputs=outputs)
 
-def create_policy_network(input_size=208, hidden_size=512, num_res_blocks=3):
-    """
-    THE STUDENT: Watches the Teacher and averages out all strategies to form the Nash Equilibrium.
-    Must have the exact same capacity as the Advantage network to memorize the strategy perfectly.
-    """
-    inputs = layers.Input(shape=(input_size,))
-    x = layers.Dense(hidden_size)(inputs)
-    x = layers.BatchNormalization()(x)
-    x = layers.Activation('relu')(x)
+def create_advantage_network():
+    return create_transformer_network(is_policy=False)
 
-    for _ in range(num_res_blocks):
-        residual = x
-        x = layers.Dense(hidden_size)(x)
-        x = layers.BatchNormalization()(x)
-        x = layers.Activation('relu')(x)
-        x = layers.Dense(hidden_size)(x)
-        x = layers.BatchNormalization()(x)
-        x = layers.Add()([x, residual]) 
-        x = layers.Activation('relu')(x)
-
-    x = layers.Dense(128, activation='relu')(x)
-    x = layers.BatchNormalization()(x)
-    
-    x = layers.Dense(1)(x)
-    outputs = layers.Activation('sigmoid')(x) # Sigmoid for Probabilities (0.0 to 1.0)
-
-    return models.Model(inputs=inputs, outputs=outputs)
+def create_policy_network():
+    return create_transformer_network(is_policy=True)
 
 # ==============================================================================
-# TRUE DEEP CFR PLAYER (CLIENT ENABLED)
+# TRUE DEEP CFR PLAYER (VECTORIZED & OPTIMIZED)
 # ==============================================================================
 class TFDeepCFRBot(Player):
     def __init__(self, name="TF Deep CFR Bot", adv_model_path="tf_advantage_model.keras", 
@@ -76,14 +59,12 @@ class TFDeepCFRBot(Player):
         super().__init__(name)
         self.is_training = is_training
         self.exploration_rate = exploration_rate if is_training else 0.0
-        self.pipe = pipe  # IPC Pipe for sending math to the GPU Server
+        self.pipe = pipe  
         
-        self.episode_memory = [] # Tracks moves to calculate Regret later
-        self.policy_memory = []  # Tracks probabilities to teach the Policy Network
+        self.episode_memory = [] 
+        self.policy_memory = []  
         
-        # If no pipe is provided (e.g., standalone app), load the heavy networks into local RAM
         if self.pipe is None:
-            # OPTIMIZATION: Load full models compiled=False for lightning-fast local inference
             try:
                 self.adv_net = tf.keras.models.load_model(adv_model_path, compile=False)
             except:
@@ -101,16 +82,59 @@ class TFDeepCFRBot(Player):
         rank, suit = card
         return RANKS.index(rank) * 4 + SUITS.index(suit)
 
-    def _encode_cards(self, cards):
-        # FAST CPU EXECUTION: Let the CPU use native float32
-        array = np.zeros(52, dtype=np.float32)
-        if cards:
-            for card in cards:
-                array[self._card_to_index(card)] = 1.0
-        return array
+    def _encode_base_sequence(self, game_state):
+        MAX_SEQ_LEN = 37 
+        FEATURE_DIM = 55
+        seq = np.zeros((MAX_SEQ_LEN, FEATURE_DIM), dtype=np.float32)
+        
+        my_idx = game_state.get('my_idx', 0)
+        current_my_size = game_state.get('my_hand_size', 13) 
+        current_opp_size = game_state.get('opp_hand_size', 13) 
+        
+        my_s_norm = current_my_size / 13.0
+        opp_s_norm = current_opp_size / 13.0
+
+        # Row 0: Current Hand
+        for c in self.hand: seq[0, self._card_to_index(c)] = 1.0
+        seq[0, 52], seq[0, 53], seq[0, 54] = 1.0, my_s_norm, opp_s_norm
+        
+        # Row 1: Current Table
+        for c in game_state.get('table_cards', []): seq[1, self._card_to_index(c)] = 1.0
+        seq[1, 52], seq[1, 53], seq[1, 54] = 0.0, my_s_norm, opp_s_norm
+        
+        # Row 2 (Action) is skipped here!
+        
+        # Row 3: Explicit Dead Cards Mask
+        for c in game_state.get('dead_cards', []): seq[3, self._card_to_index(c)] = 1.0
+        seq[3, 52], seq[3, 53], seq[3, 54] = 0.0, my_s_norm, opp_s_norm
+        
+        # Rows 4+: Historical Turn Sequence
+        history = game_state.get('history', [])
+        hist_len = min(len(history), MAX_SEQ_LEN - 4)
+        
+        hist_my_size = current_my_size
+        hist_opp_size = current_opp_size
+        
+        for i in range(hist_len):
+            row_idx = 4 + i
+            hist_item = history[-(i+1)] 
+            hist_player_idx, hist_cards = hist_item[0], hist_item[1]
+            
+            for c in hist_cards:
+                seq[row_idx, self._card_to_index(c)] = 1.0
+                
+            seq[row_idx, 52] = 1.0 if hist_player_idx == my_idx else -1.0
+            seq[row_idx, 53] = hist_my_size / 13.0
+            seq[row_idx, 54] = hist_opp_size / 13.0
+            
+            if hist_player_idx == my_idx:
+                hist_my_size += len(hist_cards)
+            else:
+                hist_opp_size += len(hist_cards)
+            
+        return seq
 
     def _get_legal_actions(self, game_state):
-        """Generates all mathematically legal moves according to Big Two rules."""
         valid_actions = [[]] if game_state.get('table_eval') else []
         for card in self.hand:
             eval_res = evaluate_play([card])
@@ -140,77 +164,60 @@ class TFDeepCFRBot(Player):
     def get_play(self, game_state):
         legal_actions = self._get_legal_actions(game_state)
         
-        # Auto-play if there's no choice
         if len(legal_actions) <= 1:
             return legal_actions[0] if legal_actions else []
             
-        # Encode the game environment into a tensor
-        hand_arr = self._encode_cards(self.hand)
-        table_arr = self._encode_cards(game_state.get('table_cards', []))
-        dead_arr = self._encode_cards(game_state.get('dead_cards', []))
+        base_sequence = self._encode_base_sequence(game_state)
+        batch_inputs = np.empty((len(legal_actions), 37, 55), dtype=np.float32)
         
-        batch_inputs = []
-        for action in legal_actions:
-            action_arr = self._encode_cards(action)
-            batch_inputs.append(np.concatenate([hand_arr, table_arr, dead_arr, action_arr]))
-        batch_inputs = np.array(batch_inputs)
+        my_s_norm = game_state.get('my_hand_size', 13) / 13.0
+        opp_s_norm = game_state.get('opp_hand_size', 13) / 13.0
+
+        for i, action in enumerate(legal_actions):
+            np.copyto(batch_inputs[i], base_sequence) 
+            for c in action:
+                batch_inputs[i, 2, self._card_to_index(c)] = 1.0
+            batch_inputs[i, 2, 52] = 1.0
+            batch_inputs[i, 2, 53] = my_s_norm
+            batch_inputs[i, 2, 54] = opp_s_norm
         
         if self.is_training:
-            # ==================================================================
-            # PHASE 1: EXPLORATION (Teacher Network calculates Q-Values)
-            # ==================================================================
-            
-            # Send tensor over the pipe to the GPU (or evaluate locally)
             if self.pipe:
-                self.pipe.send((False, batch_inputs)) # False = "Use Advantage Network"
-                q_values = self.pipe.recv().flatten().tolist()
+                self.pipe.send((False, batch_inputs.astype(np.float16)))
+                advantages = self.pipe.recv().flatten().tolist()
             else:
-                q_values = self.adv_net(batch_inputs, training=False).numpy().flatten().tolist()
+                advantages = self.adv_net(batch_inputs, training=False).numpy().flatten().tolist()
             
-            # CFR MATH: Calculate Baseline Expected Value V(s)
-            baseline_value = sum(q_values) / len(q_values)
-            
-            # CFR MATH: Regret is the Q-value MINUS the Baseline
-            advantages = [q - baseline_value for q in q_values]
+            baseline_value = sum(advantages) / len(advantages)
+            regrets = [adv - baseline_value for adv in advantages]
                     
-            # REGRET MATCHING: Convert positive advantages into probabilities
-            positive_advs = [max(a, 0.0) for a in advantages]
+            positive_advs = [max(a, 0.0) for a in regrets]
             sum_advs = sum(positive_advs)
             
             if sum_advs > 0: probabilities = [a / sum_advs for a in positive_advs]
-            else: probabilities = [1.0 / len(legal_actions)] * len(legal_actions) # Fallback
+            else: probabilities = [1.0 / len(legal_actions)] * len(legal_actions) 
 
-            # EXPLORATION: Inject random noise so the bot tries new strategies
             if self.exploration_rate > 0:
                 explore_prob = self.exploration_rate / len(legal_actions)
                 final_probs = [(p * (1.0 - self.exploration_rate)) + explore_prob for p in probabilities]
             else:
                 final_probs = probabilities
                 
-            # Pick a move based on the generated probability distribution
             chosen_index = random.choices(range(len(legal_actions)), weights=final_probs, k=1)[0]
             
-            # Store the true state value so the worker can calculate the Final Regret later
             self.episode_memory.append({
                 'inputs': batch_inputs, 'chosen_index': chosen_index, 'baseline_value': baseline_value
             })
-            
-            # Store the probability so the Policy Network can learn it
             for i in range(len(legal_actions)):
                 self.policy_memory.append((batch_inputs[i], probabilities[i]))
-                
             return legal_actions[chosen_index]
             
         else:
-            # ==================================================================
-            # PHASE 2: EXPLOITATION (Student Network plays the Nash Equilibrium)
-            # ==================================================================
             if self.pipe:
-                self.pipe.send((True, batch_inputs)) # True = "Use Policy Network"
+                self.pipe.send((True, batch_inputs.astype(np.float16)))
                 policy_probs = self.pipe.recv().flatten().tolist()
             else:
                 policy_probs = self.policy_net(batch_inputs, training=False).numpy().flatten().tolist()
                 
-            # Act greedily (100% confidence) on the best move 
             best_action_idx = np.argmax(policy_probs)
             return legal_actions[best_action_idx]

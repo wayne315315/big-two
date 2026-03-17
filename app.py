@@ -19,14 +19,12 @@ def init_game():
     random.shuffle(deck)
     piles = [deck[i * 13 : (i + 1) * 13] for i in range(4)]
     
-    # We use the base Player class for the human so it doesn't trigger the terminal input()
     human = Player("Player 1 (You)")
     bot = TFDeepCFRBot("CFR Bot")
     
     human.receive_cards(piles[0])
     bot.receive_cards(piles[1])
     
-    # Determine the absolute lowest card
     p1_lowest = human.hand[0]
     p2_lowest = bot.hand[0]
     
@@ -48,53 +46,54 @@ def init_game():
             'table_cards': [],
             'is_first_turn': True,
             'lowest_card': lowest_card,
-            'dead_cards': []  # Starts strictly empty
+            'dead_cards': [],
+            'history': [] # INJECT HISTORY
         }
     }
 
 @app.route('/')
 def index():
-    """Serves the main HTML page."""
     return render_template('index.html')
 
 @app.route('/api/reset', methods=['POST'])
 def reset():
-    """Resets and starts a new game."""
     init_game()
     return get_state()
 
 @app.route('/api/state', methods=['GET'])
 def get_state():
-    """Returns the current game state to the frontend UI."""
     if not game_instance:
         init_game()
         
     gs = game_instance['game_state_dict']
     bot = game_instance['bot']
+    human = game_instance['human']
     
-    # Calculate the bot's legal actions from its current perspective
     bot_legal_actions = []
-    is_game_over = len(game_instance['human'].hand) == 0 or len(bot.hand) == 0
+    is_game_over = len(human.hand) == 0 or len(bot.hand) == 0
+    
     if not is_game_over:
+        # Pre-feed the required variables for the Bot's inference
+        gs['my_idx'] = 1
+        gs['my_hand_size'] = len(bot.hand)
+        gs['opp_hand_size'] = len(human.hand)
         bot_legal_actions = bot._get_legal_actions(gs)
         
     return jsonify({
-        'human_hand': game_instance['human'].hand,
-        'bot_hand': bot.hand,  # Added to show bot's hand
+        'human_hand': human.hand,
+        'bot_hand': bot.hand,  
         'bot_card_count': len(bot.hand),
         'table_cards': gs['table_cards'],
-        'dead_cards': gs['dead_cards'],  # Added to show dead cards
-        'bot_legal_actions': bot_legal_actions,  # Added to show valid actions
-        'current_turn': game_instance['current_idx'], # 0 for Human, 1 for Bot
+        'dead_cards': gs['dead_cards'], 
+        'bot_legal_actions': bot_legal_actions,  
+        'current_turn': game_instance['current_idx'], 
         'message': game_instance['message'],
         'is_game_over': is_game_over
     })
 
 @app.route('/api/play', methods=['POST'])
 def play_cards():
-    """Handles the human player submitting cards."""
     data = request.json
-    # Convert JSON lists back to tuples so they match our Python game logic
     selected_cards = [tuple(c) for c in data.get('cards', [])]
     
     if not selected_cards:
@@ -103,24 +102,22 @@ def play_cards():
     human = game_instance['human']
     gs = game_instance['game_state_dict']
 
-    # 1. Enforce First Turn Rule
     if gs['is_first_turn'] and gs['lowest_card'] not in selected_cards:
         req_card = gs['lowest_card']
         return jsonify({'error': f"You must include the {req_card[0]} of {req_card[1]} on the first turn."}), 400
 
-    # 2. Evaluate Play
     curr_eval = evaluate_play(selected_cards)
     if not curr_eval:
         return jsonify({'error': 'Not a recognized Big Two hand.'}), 400
 
-    # 3. Check against Table State
     if not is_valid_beat(curr_eval, gs['table_eval']):
         return jsonify({'error': 'Your play is not high enough to beat the table, or does not match the card type.'}), 400
 
-    # Apply valid play
+    # Apply valid human play
     human.remove_cards(selected_cards)
     
-    # Sweep the previously beaten cards to the dead pile before overwriting
+    gs['history'].append((0, selected_cards)) # Human played cards
+    
     if gs['table_cards']:
         gs['dead_cards'].extend(gs['table_cards'])
         
@@ -131,22 +128,22 @@ def play_cards():
     
     game_instance['message'] = f"You played: {', '.join([f'{c[0]} of {c[1]}' for c in selected_cards])}"
     
-    # Check win
     if not human.hand:
         game_instance['message'] = "YOU WIN THE GAME!"
     else:
-        game_instance['current_idx'] = 1 # Switch to Bot's turn
+        game_instance['current_idx'] = 1
         check_table_control()
 
     return get_state()
 
 @app.route('/api/pass', methods=['POST'])
 def pass_turn():
-    """Handles the human passing their turn."""
     gs = game_instance['game_state_dict']
     if not gs['table_eval']:
         return jsonify({'error': 'You cannot pass! You control the table.'}), 400
         
+    gs['history'].append((0, [])) # Human passed
+    
     game_instance['message'] = "You passed."
     game_instance['current_idx'] = 1
     check_table_control()
@@ -154,9 +151,14 @@ def pass_turn():
 
 @app.route('/api/bot_turn', methods=['POST'])
 def bot_turn():
-    """Triggers the bot's logic to make a move."""
     bot = game_instance['bot']
+    human = game_instance['human']
     gs = game_instance['game_state_dict']
+    
+    # Pre-feed metrics
+    gs['my_idx'] = 1
+    gs['my_hand_size'] = len(bot.hand)
+    gs['opp_hand_size'] = len(human.hand)
     
     selected_cards = bot.get_play(gs)
     
@@ -164,6 +166,7 @@ def bot_turn():
         if not gs['table_eval']:
             selected_cards = [bot.hand[0]] # Failsafe
         else:
+            gs['history'].append((1, [])) # Bot passed
             game_instance['message'] = "Bot passed."
             game_instance['current_idx'] = 0
             check_table_control()
@@ -172,7 +175,8 @@ def bot_turn():
     curr_eval = evaluate_play(selected_cards)
     bot.remove_cards(selected_cards)
     
-    # Sweep the previously beaten cards to the dead pile before overwriting
+    gs['history'].append((1, selected_cards)) # Bot played cards
+    
     if gs['table_cards']:
         gs['dead_cards'].extend(gs['table_cards'])
         
@@ -183,7 +187,6 @@ def bot_turn():
     
     game_instance['message'] = f"Bot played: {', '.join([f'{c[0]} of {c[1]}' for c in selected_cards])}"
     
-    # Check win
     if not bot.hand:
         game_instance['message'] = "BOT WINS THE GAME!"
     else:
@@ -193,10 +196,8 @@ def bot_turn():
     return get_state()
 
 def check_table_control():
-    """Checks if a player won the trick (the other passed)."""
     gs = game_instance['game_state_dict']
     if game_instance['last_player_idx'] == game_instance['current_idx']:
-        # The table is won, sweep the remaining table cards to dead cards
         if gs['table_cards']:
             gs['dead_cards'].extend(gs['table_cards'])
             

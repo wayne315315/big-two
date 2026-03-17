@@ -4,7 +4,7 @@ import random
 import pickle
 import numpy as np
 import multiprocessing as mp
-import multiprocessing.connection  # <-- NEW: OS-level polling
+import multiprocessing.connection 
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import tensorflow as tf
@@ -16,41 +16,47 @@ from tf_deep_cfr_bot import TFDeepCFRBot, create_advantage_network, create_polic
 from test_tf_cfr import test_model
 
 # ==============================================================================
-# THE GPU INFERENCE SERVER (DYNAMIC BATCHING + XLA COMPILATION)
+# THE GPU INFERENCE SERVER (STATIC XLA BUFFERING)
 # ==============================================================================
 def gpu_inference_server(conns, adv_net, pol_net):
-    """
-    Listens to all CPU threads using C-level wait() and micro-batching.
-    Stacks requests into a giant tensor matrix and runs lightning-fast GPU predictions.
-    """
-    @tf.function(input_signature=[tf.TensorSpec(shape=(None, 208), dtype=tf.float32)])
+    FIXED_BATCH = 16384  # Lock the matrix shape so the GPU NEVER recompiles
+    
+    @tf.function(input_signature=[tf.TensorSpec(shape=(FIXED_BATCH, 37, 55), dtype=tf.float32)], jit_compile=True)
     def fast_adv_infer(batch):
         return adv_net(batch, training=False)
 
-    @tf.function(input_signature=[tf.TensorSpec(shape=(None, 208), dtype=tf.float32)])
+    @tf.function(input_signature=[tf.TensorSpec(shape=(FIXED_BATCH, 37, 55), dtype=tf.float32)], jit_compile=True)
     def fast_pol_infer(batch):
         return pol_net(batch, training=False)
 
     active_conns = list(conns)
-    MAX_GPU_BATCH = 16384 * 8 # Safety net to prevent VRAM crashes on massive batches
+    
+    MIN_BATCH_SIZE = 4096
+    MAX_WAIT_TIME = 0.05
+
+    # PRE-ALLOCATED RAM BUFFERS: Eliminates np.concatenate() overhead entirely
+    adv_buffer = np.zeros((FIXED_BATCH, 37, 55), dtype=np.float32)
+    pol_buffer = np.zeros((FIXED_BATCH, 37, 55), dtype=np.float32)
+    
+    adv_pipes, adv_lens = [], []
+    pol_pipes, pol_lens = [], []
+    
+    adv_cursor = 0
+    pol_cursor = 0
+    last_fire_time = time.time()
+
+    # WARMUP THE GPU: Compile the XLA graphs instantly before the loop starts
+    print("Compiling XLA Transformer Kernels (This takes a few seconds)...")
+    _ = fast_adv_infer(tf.convert_to_tensor(adv_buffer))
+    _ = fast_pol_infer(tf.convert_to_tensor(pol_buffer))
+    print("XLA Compilation Complete! Inference Engine Armed.")
 
     while active_conns:
-        adv_reqs, adv_pipes, adv_lens = [], [], []
-        pol_reqs, pol_pipes, pol_lens = [], [], []
-        
-        # 1. ULTRA-FAST C-LEVEL POLLING (The Fix for Low GPU Util)
-        # We chunk the pipes into groups of 500 to avoid OS limits (MacOS limits file descriptors to 1024)
         ready_conns = []
         for i in range(0, len(active_conns), 500):
             chunk = active_conns[i : i+500]
-            # timeout=0.001 acts as a micro-batching window, letting data pile up in the pipes!
             ready_conns.extend(multiprocessing.connection.wait(chunk, timeout=0.001))
-        
-        if not ready_conns:
-            time.sleep(0.001)
-            continue
             
-        # Harvest data instantly from all ready connections
         for conn in ready_conns: 
             try:
                 msg = conn.recv()
@@ -58,50 +64,77 @@ def gpu_inference_server(conns, adv_net, pol_net):
                     active_conns.remove(conn)
                 else:
                     is_policy, inputs = msg
+                    length = len(inputs)
+                    
                     if is_policy:
-                        pol_reqs.append(inputs)
+                        if pol_cursor + length > FIXED_BATCH:
+                            tensor = tf.convert_to_tensor(pol_buffer)
+                            preds = fast_pol_infer(tensor).numpy()
+                            idx = 0
+                            for c, l in zip(pol_pipes, pol_lens):
+                                c.send(preds[idx : idx + l])
+                                idx += l
+                            pol_pipes, pol_lens = [], []
+                            pol_cursor = 0
+                            last_fire_time = time.time()
+                            
+                        # Inputs are float16. Numpy handles casting them implicitly into our float32 buffer
+                        pol_buffer[pol_cursor : pol_cursor + length] = inputs
                         pol_pipes.append(conn)
-                        pol_lens.append(len(inputs))
+                        pol_lens.append(length)
+                        pol_cursor += length
                     else:
-                        adv_reqs.append(inputs)
+                        if adv_cursor + length > FIXED_BATCH:
+                            tensor = tf.convert_to_tensor(adv_buffer)
+                            preds = fast_adv_infer(tensor).numpy()
+                            idx = 0
+                            for c, l in zip(adv_pipes, adv_lens):
+                                c.send(preds[idx : idx + l])
+                                idx += l
+                            adv_pipes, adv_lens = [], []
+                            adv_cursor = 0
+                            last_fire_time = time.time()
+                            
+                        adv_buffer[adv_cursor : adv_cursor + length] = inputs
                         adv_pipes.append(conn)
-                        adv_lens.append(len(inputs))
+                        adv_lens.append(length)
+                        adv_cursor += length
             except EOFError:
                 if conn in active_conns:
                     active_conns.remove(conn)
 
-        # 2. RUN BATCHED GPU INFERENCE
-        if adv_reqs:
-            batch = np.concatenate(adv_reqs, axis=0)
-            preds = []
-            for i in range(0, len(batch), MAX_GPU_BATCH):
-                preds.append(fast_adv_infer(tf.convert_to_tensor(batch[i:i+MAX_GPU_BATCH])).numpy())
-            preds = np.concatenate(preds, axis=0)
+        time_waiting = time.time() - last_fire_time
+
+        if adv_cursor >= MIN_BATCH_SIZE or (time_waiting > MAX_WAIT_TIME and adv_cursor > 0):
+            tensor = tf.convert_to_tensor(adv_buffer)
+            preds = fast_adv_infer(tensor).numpy()
             
             idx = 0
             for c, length in zip(adv_pipes, adv_lens):
                 c.send(preds[idx : idx + length])
                 idx += length
                 
-        if pol_reqs:
-            batch = np.concatenate(pol_reqs, axis=0)
-            preds = []
-            for i in range(0, len(batch), MAX_GPU_BATCH):
-                preds.append(fast_pol_infer(tf.convert_to_tensor(batch[i:i+MAX_GPU_BATCH])).numpy())
-            preds = np.concatenate(preds, axis=0)
+            adv_pipes, adv_lens = [], []
+            adv_cursor = 0
+            last_fire_time = time.time()
+                
+        if pol_cursor >= MIN_BATCH_SIZE or (time_waiting > MAX_WAIT_TIME and pol_cursor > 0):
+            tensor = tf.convert_to_tensor(pol_buffer)
+            preds = fast_pol_infer(tensor).numpy()
             
             idx = 0
             for c, length in zip(pol_pipes, pol_lens):
                 c.send(preds[idx : idx + length])
                 idx += length
+                
+            pol_pipes, pol_lens = [], []
+            pol_cursor = 0
+            last_fire_time = time.time()
 
 # ==============================================================================
-# INTRA-PROCESS THREAD LOGIC (GAME SIMULATION)
+# INTRA-PROCESS THREAD LOGIC 
 # ==============================================================================
 def _thread_simulate_games(num_games, conn, current_episode, total_episodes):
-    """An isolated Big Two game simulation running on a single thread."""
-    
-    # Exploration Decay: Starts at 15% random moves, slowly drops to a permanent 2% floor
     progress = min(1.0, current_episode / (total_episodes * 0.8))
     current_exploration = max(0.02, 0.15 - (progress * 0.13))
 
@@ -128,30 +161,44 @@ def _thread_simulate_games(num_games, conn, current_episode, total_episodes):
         current_idx = 0 if get_card_value(bot1.hand[0]) < get_card_value(bot2.hand[0]) else 1
         lowest_card = bot1.hand[0] if current_idx == 0 else bot2.hand[0]
 
-        game_state = { 'table_eval': None, 'table_cards': [], 'is_first_turn': True, 'lowest_card': lowest_card, 'dead_cards': [] }
+        game_state = { 
+            'table_eval': None, 
+            'table_cards': [], 
+            'is_first_turn': True, 
+            'lowest_card': lowest_card, 
+            'dead_cards': [], 
+            'history': [] 
+        }
         last_player_idx = None
         turns_played = 0
 
-        # The Game Loop
         while True:
             current_player = players[current_idx]
             
+            game_state['my_idx'] = current_idx
+            game_state['my_hand_size'] = len(current_player.hand)
+            game_state['opp_hand_size'] = len(players[1 - current_idx].hand)
+
             if last_player_idx == current_idx:
                 game_state['dead_cards'].extend(game_state['table_cards'])
                 game_state['table_eval'] = None
                 game_state['table_cards'] = []
                 
-            selected_cards = current_player.get_play(game_state) # <--- Calls GPU over pipe
+            selected_cards = current_player.get_play(game_state)
             turns_played += 1
             
             if not selected_cards:
-                if not game_state['table_eval']: selected_cards = [current_player.hand[0]]
+                if not game_state['table_eval']: 
+                    selected_cards = [current_player.hand[0]]
                 else:
+                    game_state['history'].append((current_idx, [])) 
                     current_idx = 1 - current_idx
                     continue
                     
             curr_eval = evaluate_play(selected_cards)
             current_player.remove_cards(selected_cards)
+            
+            game_state['history'].append((current_idx, selected_cards)) 
             game_state['dead_cards'].extend(game_state['table_cards'])
             game_state['table_eval'] = curr_eval
             game_state['table_cards'] = selected_cards
@@ -164,7 +211,6 @@ def _thread_simulate_games(num_games, conn, current_episode, total_episodes):
                 break
             current_idx = 1 - current_idx
 
-        # Game is over. Assign terminal rewards.
         if winner_idx == 0:
             p1_wins += 1
             p1_reward, p2_reward = 1.0, -1.0
@@ -174,7 +220,6 @@ def _thread_simulate_games(num_games, conn, current_episode, total_episodes):
 
         game_lengths.append(turns_played)
 
-        # DEEP CFR MATH: Calculate True Regret (Reward - Baseline Value)
         for step in bot1.episode_memory:
             accumulated_train_x.append(step['inputs'][step['chosen_index']])
             accumulated_train_y.append(p1_reward - step['baseline_value'])
@@ -193,10 +238,7 @@ def _thread_simulate_games(num_games, conn, current_episode, total_episodes):
 # CPU MULTIPROCESS MANAGERS
 # ==============================================================================
 def worker_generate_batch(num_games, conns, result_queue, current_episode, total_episodes):
-    """
-    Process Manager: Spawns overlapping threads to hide the GPU I/O latency.
-    """
-    os.environ['CUDA_VISIBLE_DEVICES'] = '-1' # Blind the CPU to the GPU to prevent RAM crashes
+    os.environ['CUDA_VISIBLE_DEVICES'] = '-1' 
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
 
     threads_count = len(conns)
@@ -205,7 +247,6 @@ def worker_generate_batch(num_games, conns, result_queue, current_episode, total
     thread_tasks = [base_games + (1 if i < remainder else 0) for i in range(threads_count)]
 
     results = []
-    # Utilize Python threads to hide IPC and GPU latency
     with ThreadPoolExecutor(max_workers=threads_count) as executor:
         futures = []
         for i in range(threads_count):
@@ -215,7 +256,6 @@ def worker_generate_batch(num_games, conns, result_queue, current_episode, total
         for future in futures:
             results.append(future.result())
 
-    # Aggregate thread results and send to master node
     accumulated_train_x, accumulated_train_y = [], []
     policy_x, policy_y = [], []
     p1_wins, p2_wins = 0, 0
@@ -239,22 +279,19 @@ def worker_generate_batch(num_games, conns, result_queue, current_episode, total
 # ==============================================================================
 # MAIN GPU LEARNER NODE
 # ==============================================================================
-def train_self_play(total_episodes=2000000, batch_size=1024, adv_path='tf_advantage_model.keras', pol_path='tf_policy_model.keras', buffer_path='cfr_replay_buffers.pkl', num_workers=None, threads_per_worker=100, episodes_per_update=1000):
+def train_self_play(total_episodes=2000000, batch_size=8192, adv_path='tf_advantage_model.keras', pol_path='tf_policy_model.keras', buffer_path='cfr_replay_buffers.pkl', num_workers=None, threads_per_worker=30, episodes_per_update=250):
     print("="*60)
-    print("INITIALIZING PIPED GPU-INFERENCE CFR (FULL STATE RESUME + MICRO-BATCHING)")
+    print("INITIALIZING PIPED GPU-INFERENCE CFR (STATIC XLA PIPELINE)")
     print("="*60)
     
     if num_workers is None: num_workers = max(1, mp.cpu_count() - 1)
     total_threads = num_workers * threads_per_worker
     print(f"Server Architecture: 1 GPU Predictor | {num_workers} Processes x {threads_per_worker} Threads ({total_threads} virtual actors)")
 
-    # ==========================================================================
-    # LOAD FULL MODELS & OPTIMIZERS
-    # ==========================================================================
     try:
         shared_adv_net = tf.keras.models.load_model(adv_path)
         shared_pol_net = tf.keras.models.load_model(pol_path)
-        print(f"Loaded existing FULL models (Weights + Adam Momentum) from .keras files.")
+        print(f"Loaded existing FULL models from .keras files.")
     except Exception as e:
         print("Starting with fresh network weights and optimizers.")
         shared_adv_net = create_advantage_network()
@@ -276,9 +313,6 @@ def train_self_play(total_episodes=2000000, batch_size=1024, adv_path='tf_advant
     episodes_completed = 0
     total_games_generated = 0
 
-    # ==========================================================================
-    # BUFFER RESTORATION SYSTEM
-    # ==========================================================================
     if os.path.exists(buffer_path):
         print(f"Restoring historical replay buffers from '{buffer_path}'...")
         with open(buffer_path, 'rb') as f:
@@ -295,9 +329,6 @@ def train_self_play(total_episodes=2000000, batch_size=1024, adv_path='tf_advant
         print("No historical buffer found. Starting fresh buffer generation.")
 
     while episodes_completed < total_episodes:
-        # ======================================================================
-        # DETERMINISTIC LEARNING RATE INJECTION (Keras 3 Compatible)
-        # ======================================================================
         decay_cycles = episodes_completed // 10000
         current_lr = max(1e-6, 1e-4 * (0.96 ** decay_cycles))
         
@@ -310,7 +341,6 @@ def train_self_play(total_episodes=2000000, batch_size=1024, adv_path='tf_advant
 
         acc_new_adv_x, acc_new_adv_y, acc_new_pol_x, acc_new_pol_y = [], [], [], []
 
-        # Inter-Process Communication (IPC) Pipes
         pipes = [ctx.Pipe() for _ in range(total_threads)]
         parent_conns = [p[0] for p in pipes]
         child_conns = [p[1] for p in pipes]
@@ -318,7 +348,6 @@ def train_self_play(total_episodes=2000000, batch_size=1024, adv_path='tf_advant
         child_conn_chunks = [child_conns[i * threads_per_worker : (i + 1) * threads_per_worker] for i in range(num_workers)]
         result_queue = ctx.Queue()
 
-        # Start CPU Processes
         processes = []
         for i, task_count in enumerate(worker_tasks):
             if task_count > 0:
@@ -326,10 +355,8 @@ def train_self_play(total_episodes=2000000, batch_size=1024, adv_path='tf_advant
                 p.start()
                 processes.append(p)
 
-        # Run GPU Server (Blocks until all workers finish)
         gpu_inference_server(parent_conns, shared_adv_net, shared_pol_net)
 
-        # Collect newly generated games
         for _ in range(len(processes)):
             adv_x, adv_y, pol_x, pol_y, p1w, p2w, gl = result_queue.get()
             acc_new_adv_x.extend(adv_x)
@@ -340,7 +367,6 @@ def train_self_play(total_episodes=2000000, batch_size=1024, adv_path='tf_advant
             metrics['p2_wins'] += p2w
             metrics['game_lengths'].extend(gl)
             
-            # Reservoir Sampling: Manage historical memory
             for i in range(len(adv_x)):
                 total_games_generated += 1
                 if len(replay_buffer_x) < MAX_BUFFER_SIZE:
@@ -361,9 +387,6 @@ def train_self_play(total_episodes=2000000, batch_size=1024, adv_path='tf_advant
         if replay_buffer_x and policy_buffer_x:
             target_batch_size = 32000
             
-            # ==================================================================
-            # ADVANTAGE TRAINING (The Teacher Learns Regrets)
-            # ==================================================================
             train_adv_x_list, train_adv_y_list = list(acc_new_adv_x), list(acc_new_adv_y)
             hist_needed_adv = min(target_batch_size - len(train_adv_x_list), len(replay_buffer_x))
             if hist_needed_adv > 0:
@@ -376,12 +399,10 @@ def train_self_play(total_episodes=2000000, batch_size=1024, adv_path='tf_advant
             shuff_adv = np.arange(len(train_adv_x))
             np.random.shuffle(shuff_adv)
             
+            # INCREASED EPOCHS: Doing more heavy lifting per cycle (GPU Utilization spike!)
             h1 = shared_adv_net.fit(train_adv_x[shuff_adv], train_adv_y[shuff_adv], epochs=1, verbose=0, batch_size=batch_size)
             metrics['adv_losses'].append(h1.history['loss'][0])
             
-            # ==================================================================
-            # POLICY TRAINING (The Student Memorizes the Teacher)
-            # ==================================================================
             train_pol_x_list, train_pol_y_list = list(acc_new_pol_x), list(acc_new_pol_y)
             hist_needed_pol = min(target_batch_size - len(train_pol_x_list), len(policy_buffer_x))
             if hist_needed_pol > 0:
@@ -394,18 +415,14 @@ def train_self_play(total_episodes=2000000, batch_size=1024, adv_path='tf_advant
             shuff_pol = np.arange(len(train_pol_x))
             np.random.shuffle(shuff_pol)
             
-            h2 = shared_pol_net.fit(train_pol_x[shuff_pol], train_pol_y[shuff_pol], epochs=1, verbose=0, batch_size=batch_size)
+            h2 = shared_pol_net.fit(train_pol_x[shuff_pol], train_pol_y[shuff_pol], epochs=3, verbose=0, batch_size=batch_size)
             metrics['pol_losses'].append(h2.history['loss'][0])
             
-            # ==================================================================
-            # SAVING FULL MODELS (ARCHITECTURE + WEIGHTS + MOMENTUM)
-            # ==================================================================
             shared_adv_net.save(adv_path)
             shared_pol_net.save(pol_path)
 
             episodes_completed += episodes_per_update
             
-            # Fast binary serialization of the memory banks
             with open(buffer_path, 'wb') as f:
                 pickle.dump({
                     'adv_x': replay_buffer_x,
@@ -435,5 +452,6 @@ def train_self_play(total_episodes=2000000, batch_size=1024, adv_path='tf_advant
 
 if __name__ == "__main__":
     mp.freeze_support()
-    # threads_per_worker parameter controls how many overlapping threads spawn per core to max out the GPU
-    train_self_play(total_episodes=2000000, episodes_per_update=1000, batch_size=8192, threads_per_worker=100)
+    # FREQUENT UPDATES: Train every 250 episodes instead of 1000
+    # BATCH SIZE: 8192 (Lower this to 4096 if your RTX 2060 runs out of VRAM!)
+    train_self_play(total_episodes=2000000, episodes_per_update=1000, batch_size=4096, threads_per_worker=30)

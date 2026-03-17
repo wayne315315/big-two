@@ -2,7 +2,7 @@ import os
 import time
 import random
 import multiprocessing as mp
-import multiprocessing.connection # <-- NEW: OS-level polling
+import multiprocessing.connection 
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import tensorflow as tf
@@ -12,30 +12,35 @@ from player import BotPlayer
 from tf_deep_cfr_bot import TFDeepCFRBot, create_policy_network
 
 # ==============================================================================
-# THE GPU INFERENCE SERVER (TESTING MODE + XLA COMPILATION)
+# THE GPU INFERENCE SERVER (STATIC XLA BUFFERING)
 # ==============================================================================
 def gpu_inference_server(conns, pol_net):
-    """Dynamic GPU Batching specifically for the Policy Network using wait() micro-batching."""
+    FIXED_BATCH = 16384
     
-    @tf.function(input_signature=[tf.TensorSpec(shape=(None, 208), dtype=tf.float32)])
+    @tf.function(input_signature=[tf.TensorSpec(shape=(FIXED_BATCH, 37, 55), dtype=tf.float32)], jit_compile=True)
     def fast_pol_infer(batch):
         return pol_net(batch, training=False)
 
     active_conns = list(conns)
-    MAX_GPU_BATCH = 16384
+    
+    MIN_BATCH_SIZE = 4096
+    MAX_WAIT_TIME = 0.05
+
+    pol_buffer = np.zeros((FIXED_BATCH, 37, 55), dtype=np.float32)
+    pol_pipes, pol_lens = [], []
+    pol_cursor = 0
+    last_fire_time = time.time()
+
+    print("Compiling XLA Transformer Kernel (This takes a few seconds)...")
+    _ = fast_pol_infer(tf.convert_to_tensor(pol_buffer))
+    print("XLA Compilation Complete! Benchmark Engine Armed.")
 
     while active_conns:
-        pol_reqs, pol_pipes, pol_lens = [], [], []
-        
         ready_conns = []
         for i in range(0, len(active_conns), 500):
             chunk = active_conns[i : i+500]
             ready_conns.extend(multiprocessing.connection.wait(chunk, timeout=0.001))
         
-        if not ready_conns:
-            time.sleep(0.001)
-            continue
-            
         for conn in ready_conns:
             try:
                 msg = conn.recv()
@@ -44,30 +49,45 @@ def gpu_inference_server(conns, pol_net):
                 else:
                     is_policy, inputs = msg
                     if is_policy:  
-                        pol_reqs.append(inputs)
+                        length = len(inputs)
+                        if pol_cursor + length > FIXED_BATCH:
+                            tensor = tf.convert_to_tensor(pol_buffer)
+                            preds = fast_pol_infer(tensor).numpy()
+                            idx = 0
+                            for c, l in zip(pol_pipes, pol_lens):
+                                c.send(preds[idx : idx + l])
+                                idx += l
+                            pol_pipes, pol_lens = [], []
+                            pol_cursor = 0
+                            last_fire_time = time.time()
+                            
+                        pol_buffer[pol_cursor : pol_cursor + length] = inputs
                         pol_pipes.append(conn)
-                        pol_lens.append(len(inputs))
+                        pol_lens.append(length)
+                        pol_cursor += length
             except EOFError:
                 if conn in active_conns:
                     active_conns.remove(conn)
+                    
+        time_waiting = time.time() - last_fire_time
         
-        if pol_reqs:
-            batch = np.concatenate(pol_reqs, axis=0)
-            preds = []
-            for i in range(0, len(batch), MAX_GPU_BATCH):
-                preds.append(fast_pol_infer(tf.convert_to_tensor(batch[i:i+MAX_GPU_BATCH])).numpy())
-            preds = np.concatenate(preds, axis=0)
+        if pol_cursor >= MIN_BATCH_SIZE or (time_waiting > MAX_WAIT_TIME and pol_cursor > 0):
+            tensor = tf.convert_to_tensor(pol_buffer)
+            preds = fast_pol_infer(tensor).numpy()
             
             idx = 0
             for c, length in zip(pol_pipes, pol_lens):
                 c.send(preds[idx : idx + length])
                 idx += length
+                
+            pol_pipes, pol_lens = [], []
+            pol_cursor = 0
+            last_fire_time = time.time()
 
 # ==============================================================================
-# INTRA-PROCESS THREAD LOGIC (GAME SIMULATION)
+# INTRA-PROCESS THREAD LOGIC
 # ==============================================================================
 def _thread_test_games(num_games, conn):
-    """Tests the fully trained bot against the Standard Bot."""
     cfr_bot = TFDeepCFRBot("CFR Bot", pipe=conn, is_training=False)
     standard_bot = BotPlayer("Standard Bot")
     
@@ -86,11 +106,23 @@ def _thread_test_games(num_games, conn):
         current_idx = 0 if get_card_value(cfr_bot.hand[0]) < get_card_value(standard_bot.hand[0]) else 1
         lowest_card = cfr_bot.hand[0] if current_idx == 0 else standard_bot.hand[0]
             
-        game_state = { 'table_eval': None, 'table_cards': [], 'is_first_turn': True, 'lowest_card': lowest_card, 'dead_cards': [] }
+        game_state = { 
+            'table_eval': None, 
+            'table_cards': [], 
+            'is_first_turn': True, 
+            'lowest_card': lowest_card, 
+            'dead_cards': [], 
+            'history': [] 
+        }
         last_player_idx = None
         
         while True:
             current_player = players[current_idx]
+            
+            game_state['my_idx'] = current_idx
+            game_state['my_hand_size'] = len(current_player.hand)
+            game_state['opp_hand_size'] = len(players[1 - current_idx].hand)
+
             if last_player_idx == current_idx:
                 game_state['dead_cards'].extend(game_state['table_cards'])
                 game_state['table_eval'] = None
@@ -101,11 +133,14 @@ def _thread_test_games(num_games, conn):
             if not selected_cards:
                 if not game_state['table_eval']: selected_cards = [current_player.hand[0]]
                 else:
+                    game_state['history'].append((current_idx, []))
                     current_idx = 1 - current_idx
                     continue
                     
             curr_eval = evaluate_play(selected_cards)
             current_player.remove_cards(selected_cards)
+            
+            game_state['history'].append((current_idx, selected_cards))
             game_state['dead_cards'].extend(game_state['table_cards'])
             game_state['table_eval'] = curr_eval
             game_state['table_cards'] = selected_cards
@@ -156,7 +191,7 @@ def distributed_test_worker(num_games, conns, result_queue):
 # ==============================================================================
 # MAIN TEST ORCHESTRATOR
 # ==============================================================================
-def test_model(num_games=1000, policy_path="tf_policy_model.keras", num_workers=None, threads_per_worker=100):
+def test_model(num_games=1000, policy_path="tf_policy_model.keras", num_workers=None, threads_per_worker=10):
     print("="*60)
     print(f"DISTRIBUTED FLOAT32 GPU BENCHMARK ({num_games} GAMES)")
     print("="*60)
@@ -218,4 +253,4 @@ def test_model(num_games=1000, policy_path="tf_policy_model.keras", num_workers=
 
 if __name__ == "__main__":
     mp.freeze_support()
-    test_model(num_games=1000, threads_per_worker=100)
+    test_model(num_games=1000, threads_per_worker=30)
