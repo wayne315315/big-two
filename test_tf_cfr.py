@@ -218,4 +218,4 @@ def test_model(num_games=1000, policy_path="tf_policy_model.keras", num_workers=
 
 if __name__ == "__main__":
     mp.freeze_support()
-    test_model(num_games=10000, threads_per_worker=1000)
+    test_model(num_games=1000, threads_per_worker=100)

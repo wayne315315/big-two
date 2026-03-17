@@ -32,7 +32,7 @@ def gpu_inference_server(conns, adv_net, pol_net):
         return pol_net(batch, training=False)
 
     active_conns = list(conns)
-    MAX_GPU_BATCH = 16384  # Safety net to prevent VRAM crashes on massive batches
+    MAX_GPU_BATCH = 16384 * 8 # Safety net to prevent VRAM crashes on massive batches
 
     while active_conns:
         adv_reqs, adv_pipes, adv_lens = [], [], []
@@ -436,4 +436,4 @@ def train_self_play(total_episodes=2000000, batch_size=1024, adv_path='tf_advant
 if __name__ == "__main__":
     mp.freeze_support()
     # threads_per_worker parameter controls how many overlapping threads spawn per core to max out the GPU
-    train_self_play(total_episodes=2000000, episodes_per_update=10000, batch_size=8192, threads_per_worker=1000)
+    train_self_play(total_episodes=2000000, episodes_per_update=1000, batch_size=8192, threads_per_worker=100)
