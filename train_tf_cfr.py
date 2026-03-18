@@ -139,7 +139,8 @@ def gpu_inference_server(conns, fast_adv_infer, fast_pol_infer):
 # INTRA-PROCESS THREAD LOGIC 
 # ==============================================================================
 def _thread_simulate_games(num_games, conn, current_episode, total_episodes):
-    progress = min(1.0, current_episode / (total_episodes * 0.8))
+    #progress = min(1.0, current_episode / (total_episodes * 0.8))
+    progress = min(1.0, current_episode / (2000000 * 0.8))
     current_exploration = max(0.02, 0.15 - (progress * 0.13))
 
     bot1 = TFDeepCFRBot("Player 1", pipe=conn, is_training=True, exploration_rate=current_exploration)
@@ -541,4 +542,4 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
 
 if __name__ == "__main__":
     mp.freeze_support()
-    train_self_play(total_episodes=2000000, episodes_per_update=1000, batch_size=4096, threads_per_worker=30)
+    train_self_play(total_episodes=20000000, episodes_per_update=1000, batch_size=4096, threads_per_worker=30)
