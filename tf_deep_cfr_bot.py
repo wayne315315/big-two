@@ -4,46 +4,52 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers, models, mixed_precision
 
-# Restored missing imports!
+# Corrected Import: Removed RANK_MAP and SUIT_MAP
 from helper import RANKS, SUITS, evaluate_play, is_valid_beat
 from player import Player
 
-# ==============================================================================
-# ENABLE MIXED PRECISION (TENSOR CORES)
-# ==============================================================================
 mixed_precision.set_global_policy('mixed_float16')
 
 # ==============================================================================
-# TRANSFORMER ARCHITECTURE
+# LOCAL HASH MAPS (O(1) Lookups without touching helper.py)
 # ==============================================================================
-def transformer_encoder(inputs, head_size, num_heads, ff_dim, dropout=0.1):
-    x = layers.LayerNormalization(epsilon=1e-6)(inputs)
-    x = layers.MultiHeadAttention(key_dim=head_size, num_heads=num_heads, dropout=dropout)(x, x)
-    x = layers.Dropout(dropout)(x)
-    res = x + inputs
+RANK_MAP = {r: i for i, r in enumerate(RANKS)}
+SUIT_MAP = {s: i for i, s in enumerate(SUITS)}
 
-    x = layers.LayerNormalization(epsilon=1e-6)(res)
-    x = layers.Dense(ff_dim, activation="relu")(x)
-    x = layers.Dropout(dropout)(x)
-    x = layers.Dense(inputs.shape[-1])(x)
-    return x + res
+# ==============================================================================
+# TEMPORAL 1D RESNET ARCHITECTURE
+# ==============================================================================
+def conv1d_residual_block(x, filters, kernel_size=3, dropout_rate=0.1):
+    shortcut = x
+    
+    # 1D Convolution slides down the 37 sequence steps to learn temporal flow
+    x = layers.Conv1D(filters, kernel_size, padding='same', use_bias=False)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation('relu')(x)
+    x = layers.Dropout(dropout_rate)(x)
+    
+    x = layers.Conv1D(filters, kernel_size, padding='same', use_bias=False)(x)
+    x = layers.BatchNormalization()(x)
+    
+    x = layers.Add()([shortcut, x])
+    x = layers.Activation('relu')(x)
+    return x
 
-def create_transformer_network(input_shape=(37, 55), head_size=64, num_heads=4, ff_dim=256, num_blocks=3, is_policy=False):
+def create_temporal_resnet(input_shape=(37, 55), num_blocks=5, filters=256, is_policy=False):
     inputs = layers.Input(shape=input_shape)
     
-    positions = tf.range(start=0, limit=input_shape[0], delta=1)
-    position_embedding = layers.Embedding(input_dim=input_shape[0], output_dim=input_shape[1])(positions)
-    
-    x = inputs + position_embedding
+    x = layers.Conv1D(filters, 3, padding='same', use_bias=False)(inputs)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation('relu')(x)
     
     for _ in range(num_blocks):
-        x = transformer_encoder(x, head_size, num_heads, ff_dim)
+        x = conv1d_residual_block(x, filters)
         
     x = layers.GlobalAveragePooling1D()(x)
     x = layers.Dense(128, activation='relu')(x)
     x = layers.BatchNormalization()(x)
     
-    # MIXED PRECISION: Final output must be explicitly float32 for numerical stability
+    # MIXED PRECISION: Final output MUST be float32
     x = layers.Dense(1)(x)
     if is_policy:
         outputs = layers.Activation('sigmoid', dtype='float32')(x)
@@ -53,13 +59,13 @@ def create_transformer_network(input_shape=(37, 55), head_size=64, num_heads=4, 
     return models.Model(inputs=inputs, outputs=outputs)
 
 def create_advantage_network():
-    return create_transformer_network(is_policy=False)
+    return create_temporal_resnet(is_policy=False)
 
 def create_policy_network():
-    return create_transformer_network(is_policy=True)
+    return create_temporal_resnet(is_policy=True)
 
 # ==============================================================================
-# TRUE DEEP CFR PLAYER (VECTORIZED & OPTIMIZED)
+# TRUE DEEP CFR PLAYER (ORDERED TEMPORAL MATRIX)
 # ==============================================================================
 class TFDeepCFRBot(Player):
     def __init__(self, name="TF Deep CFR Bot", adv_model_path="tf_advantage_model.keras", 
@@ -87,8 +93,7 @@ class TFDeepCFRBot(Player):
         self.policy_memory = []
 
     def _card_to_index(self, card):
-        rank, suit = card
-        return RANKS.index(rank) * 4 + SUITS.index(suit)
+        return RANK_MAP[card[0]] * 4 + SUIT_MAP[card[1]]
 
     def _encode_base_sequence(self, game_state):
         MAX_SEQ_LEN = 37 
@@ -117,6 +122,7 @@ class TFDeepCFRBot(Player):
         hist_my_size = current_my_size
         hist_opp_size = current_opp_size
         
+        # Chronological history injection for Conv1D to read as a timeline
         for i in range(hist_len):
             row_idx = 4 + i
             hist_item = history[-(i+1)] 

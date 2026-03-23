@@ -8,17 +8,12 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras import mixed_precision
 
-# Enable Mixed Precision
 mixed_precision.set_global_policy('mixed_float16')
 
 from helper import RANKS, SUITS, get_card_value, evaluate_play
 from player import BotPlayer
 from tf_deep_cfr_bot import TFDeepCFRBot, create_policy_network
 
-# ==============================================================================
-# THE GPU INFERENCE SERVER (STATIC XLA BUFFERING)
-# ==============================================================================
-# BOTTLECK FIX: Test server now accepts the pre-compiled graph to save 10+ seconds
 def gpu_inference_server(conns, pol_net=None, fast_pol_infer=None):
     FIXED_BATCH = 16384
     
@@ -28,7 +23,7 @@ def gpu_inference_server(conns, pol_net=None, fast_pol_infer=None):
             return pol_net(batch, training=False)
         fast_pol_infer = fast_pol_infer_internal
 
-        print("Compiling XLA Transformer Kernel (This takes a few seconds)...")
+        print("Compiling XLA Temporal Conv1D Kernel (This takes a few seconds)...")
         _ = fast_pol_infer(tf.zeros((FIXED_BATCH, 37, 55), dtype=tf.float16))
         print("XLA Compilation Complete! Benchmark Engine Armed.")
 
@@ -91,9 +86,6 @@ def gpu_inference_server(conns, pol_net=None, fast_pol_infer=None):
             pol_cursor = 0
             last_fire_time = time.time()
 
-# ==============================================================================
-# INTRA-PROCESS THREAD LOGIC
-# ==============================================================================
 def _thread_test_games(num_games, conn):
     cfr_bot = TFDeepCFRBot("CFR Bot", pipe=conn, is_training=False)
     standard_bot = BotPlayer("Standard Bot")
@@ -114,12 +106,8 @@ def _thread_test_games(num_games, conn):
         lowest_card = cfr_bot.hand[0] if current_idx == 0 else standard_bot.hand[0]
             
         game_state = { 
-            'table_eval': None, 
-            'table_cards': [], 
-            'is_first_turn': True, 
-            'lowest_card': lowest_card, 
-            'dead_cards': [], 
-            'history': [] 
+            'table_eval': None, 'table_cards': [], 'is_first_turn': True, 
+            'lowest_card': lowest_card, 'dead_cards': [], 'history': [] 
         }
         last_player_idx = None
         
@@ -163,9 +151,6 @@ def _thread_test_games(num_games, conn):
             
     return cfr_wins, standard_wins
 
-# ==============================================================================
-# CPU MULTIPROCESS MANAGERS
-# ==============================================================================
 def distributed_test_worker(num_games, conns, result_queue):
     os.environ['CUDA_VISIBLE_DEVICES'] = '-1' 
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -195,10 +180,6 @@ def distributed_test_worker(num_games, conns, result_queue):
 
     result_queue.put((total_cfr_wins, total_std_wins))
 
-# ==============================================================================
-# MAIN TEST ORCHESTRATOR
-# ==============================================================================
-# Modified signature to accept pre-compiled functions
 def test_model(num_games=1000, policy_path="tf_policy_model.keras", num_workers=None, threads_per_worker=10, fast_pol_infer=None):
     print("="*60)
     print(f"DISTRIBUTED FLOAT16 GPU BENCHMARK ({num_games} GAMES)")
@@ -207,7 +188,6 @@ def test_model(num_games=1000, policy_path="tf_policy_model.keras", num_workers=
     if num_workers is None:
         num_workers = max(1, mp.cpu_count() - 1)
         
-    # Prevent over-spawning if num_games is very small
     if num_games < num_workers * threads_per_worker:
         num_workers = max(1, num_games // threads_per_worker)
         if num_workers == 0:
@@ -226,7 +206,7 @@ def test_model(num_games=1000, policy_path="tf_policy_model.keras", num_workers=
             print(f"Warning: Could not load '{policy_path}'. Using random weights.")
             shared_pol_net = create_policy_network()
     else:
-        shared_pol_net = None # Skip loading model if function is already compiled
+        shared_pol_net = None 
         
     ctx = mp.get_context('spawn')
     

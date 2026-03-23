@@ -10,7 +10,6 @@ from concurrent.futures import ThreadPoolExecutor
 import tensorflow as tf
 from tensorflow.keras import optimizers, mixed_precision
 
-# Enable Mixed Precision
 mixed_precision.set_global_policy('mixed_float16')
 
 from helper import RANKS, SUITS, get_card_value, evaluate_play
@@ -18,9 +17,6 @@ from player import BotPlayer
 from tf_deep_cfr_bot import TFDeepCFRBot, create_advantage_network, create_policy_network
 from test_tf_cfr import test_model
 
-# ==============================================================================
-# FAST MEMORY BUFFER INSERTION 
-# ==============================================================================
 def add_to_buffer(buffer_x, buffer_y, new_x, new_y, current_size, max_size):
     n = len(new_x)
     if n == 0: return current_size
@@ -40,9 +36,6 @@ def add_to_buffer(buffer_x, buffer_y, new_x, new_y, current_size, max_size):
             buffer_y[replace_idx] = new_y[rem:]
         return max_size
 
-# ==============================================================================
-# THE GPU INFERENCE SERVER (STATIC XLA BUFFERING)
-# ==============================================================================
 def gpu_inference_server(conns, fast_adv_infer, fast_pol_infer):
     FIXED_BATCH = 16384  
     active_conns = list(conns)
@@ -135,14 +128,12 @@ def gpu_inference_server(conns, fast_adv_infer, fast_pol_infer):
             pol_cursor = 0
             last_fire_time = time.time()
 
-# ==============================================================================
-# INTRA-PROCESS THREAD LOGIC 
-# ==============================================================================
 def _thread_simulate_games(num_games, conn, current_episode, total_episodes):
     #progress = min(1.0, current_episode / (total_episodes * 0.8))
     progress = min(1.0, current_episode / (2000000 * 0.8))
     current_exploration = max(0.02, 0.15 - (progress * 0.13))
 
+    # PURE SELF PLAY
     bot1 = TFDeepCFRBot("Player 1", pipe=conn, is_training=True, exploration_rate=current_exploration)
     bot2 = TFDeepCFRBot("Player 2", pipe=conn, is_training=True, exploration_rate=current_exploration)
     players = [bot1, bot2]
@@ -167,12 +158,8 @@ def _thread_simulate_games(num_games, conn, current_episode, total_episodes):
         lowest_card = bot1.hand[0] if current_idx == 0 else bot2.hand[0]
 
         game_state = { 
-            'table_eval': None, 
-            'table_cards': [], 
-            'is_first_turn': True, 
-            'lowest_card': lowest_card, 
-            'dead_cards': [], 
-            'history': [] 
+            'table_eval': None, 'table_cards': [], 'is_first_turn': True, 
+            'lowest_card': lowest_card, 'dead_cards': [], 'history': [] 
         }
         last_player_idx = None
         turns_played = 0
@@ -228,20 +215,27 @@ def _thread_simulate_games(num_games, conn, current_episode, total_episodes):
         for step in bot1.episode_memory:
             accumulated_train_x.append(step['inputs'][step['chosen_index']])
             accumulated_train_y.append(p1_reward - step['baseline_value'])
+            
+        for mem in bot1.policy_memory:
+            policy_x.append(mem[0])
+            policy_y.append(mem[1])
 
         for step in bot2.episode_memory:
             accumulated_train_x.append(step['inputs'][step['chosen_index']])
             accumulated_train_y.append(p2_reward - step['baseline_value'])
             
-        for mem in bot1.policy_memory + bot2.policy_memory:
+        for mem in bot2.policy_memory:
             policy_x.append(mem[0])
             policy_y.append(mem[1])
 
-    return accumulated_train_x, accumulated_train_y, policy_x, policy_y, p1_wins, p2_wins, game_lengths
+    return (
+        np.array(accumulated_train_x, dtype=np.float16), 
+        np.array(accumulated_train_y, dtype=np.float32), 
+        np.array(policy_x, dtype=np.float16), 
+        np.array(policy_y, dtype=np.float32), 
+        p1_wins, p2_wins, game_lengths
+    )
 
-# ==============================================================================
-# CPU MULTIPROCESS MANAGERS
-# ==============================================================================
 def worker_generate_batch(num_games, conns, result_queue, current_episode, total_episodes):
     os.environ['CUDA_VISIBLE_DEVICES'] = '-1' 
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
@@ -287,12 +281,9 @@ def worker_generate_batch(num_games, conns, result_queue, current_episode, total
         p1_wins, p2_wins, game_lengths
     ))
 
-# ==============================================================================
-# MAIN GPU LEARNER NODE
-# ==============================================================================
 def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advantage_model.keras', pol_path='tf_policy_model.keras', buffer_path='cfr_replay_buffers.pkl', num_workers=None, threads_per_worker=30, episodes_per_update=1000):
     print("="*60, flush=True)
-    print("INITIALIZING PIPED GPU-INFERENCE CFR (STATIC XLA PIPELINE)", flush=True)
+    print("INITIALIZING TEMPORAL 1D-RESNET CFR PIPELINE", flush=True)
     print("="*60, flush=True)
     
     if num_workers is None: num_workers = max(1, mp.cpu_count() - 1)
@@ -347,7 +338,7 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
     def fast_pol_infer(batch):
         return shared_pol_net(batch, training=False)
 
-    print("Compiling XLA Transformer Kernels (This takes a few seconds)...", flush=True)
+    print("Compiling XLA Temporal Conv1D Kernels (This takes a few seconds)...", flush=True)
     _ = fast_adv_infer(tf.zeros((FIXED_BATCH, 37, 55), dtype=tf.float16))
     _ = fast_pol_infer(tf.zeros((FIXED_BATCH, 37, 55), dtype=tf.float16))
     _ = train_adv_step(tf.zeros((batch_size, 37, 55), dtype=tf.float16), tf.zeros((batch_size,), dtype=tf.float32))
@@ -364,7 +355,6 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
     replay_pol_x = np.zeros((MAX_BUFFER_SIZE, 37, 55), dtype=np.float16)
     replay_pol_y = np.zeros((MAX_BUFFER_SIZE,), dtype=np.float32)
     
-    # DECOUPLED TRACKERS: The Policy size grows much faster than Advantage size
     replay_adv_size = 0
     replay_pol_size = 0
     episodes_completed = 0
@@ -434,7 +424,6 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
             metrics['game_lengths'].extend(gl)
             total_games_generated += len(adv_x)
             
-            # Independently track Advantage size and Policy size
             replay_adv_size = add_to_buffer(replay_adv_x, replay_adv_y, adv_x, adv_y, replay_adv_size, MAX_BUFFER_SIZE)
             replay_pol_size = add_to_buffer(replay_pol_x, replay_pol_y, pol_x, pol_y, replay_pol_size, MAX_BUFFER_SIZE)
 
@@ -449,7 +438,6 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
             
             target_batch_size = 32000
             
-            # Independently prepare Adv training data
             sample_adv_size = min(target_batch_size, replay_adv_size)
             sample_adv_size = (sample_adv_size // batch_size) * batch_size
             if sample_adv_size == 0: sample_adv_size = batch_size
@@ -457,7 +445,6 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
             train_adv_x = replay_adv_x[idx_adv]
             train_adv_y = replay_adv_y[idx_adv]
             
-            # Independently prepare Pol training data
             sample_pol_size = min(target_batch_size, replay_pol_size)
             sample_pol_size = (sample_pol_size // batch_size) * batch_size
             if sample_pol_size == 0: sample_pol_size = batch_size
@@ -499,17 +486,20 @@ def train_self_play(total_episodes=2000000, batch_size=4096, adv_path='tf_advant
             episodes_completed += episodes_per_update
             
             if episodes_completed % 5000 == 0:
-                with open(buffer_path, 'wb') as f:
-                    pickle.dump({
-                        'adv_x': replay_adv_x[:replay_adv_size],
-                        'adv_y': replay_adv_y[:replay_adv_size],
-                        'pol_x': replay_pol_x[:replay_pol_size],
-                        'pol_y': replay_pol_y[:replay_pol_size],
-                        'episodes_completed': episodes_completed,
-                        'total_games_generated': total_games_generated
-                    }, f, protocol=pickle.HIGHEST_PROTOCOL)
+                def async_save():
+                    with open(buffer_path, 'wb') as f:
+                        pickle.dump({
+                            'adv_x': np.copy(replay_adv_x[:replay_adv_size]),
+                            'adv_y': np.copy(replay_adv_y[:replay_adv_size]),
+                            'pol_x': np.copy(replay_pol_x[:replay_pol_size]),
+                            'pol_y': np.copy(replay_pol_y[:replay_pol_size]),
+                            'episodes_completed': episodes_completed,
+                            'total_games_generated': total_games_generated
+                        }, f, protocol=pickle.HIGHEST_PROTOCOL)
+                threading.Thread(target=async_save).start()
+                
                 d_save = time.time() - t_save_start
-                print(f"Done in {d_save:.2f}s (Models + Memory Buffer Sync)", flush=True)
+                print(f"Done in {d_save:.2f}s (Async Buffer Save Triggered)", flush=True)
             else:
                 d_save = time.time() - t_save_start
                 print(f"Done in {d_save:.2f}s (Models Only)", flush=True)
